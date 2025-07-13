@@ -1,0 +1,67 @@
+# ---------------------------------------------------
+#          Aura Engine Configuration File
+# ---------------------------------------------------
+
+# -- Inter-Process Communication (IPC) Settings --
+# The local TCP port for the WebSocket server that the web portal connects to.
+# This should only be accessible from the local machine (127.0.0.1).
+ipc_port = 9898
+
+# -- Peer-to-Peer (P2P) Network Settings --
+# The port the engine will use to listen for incoming connections from other nodes.
+# This port may need to be forwarded on a user's router for optimal WAN mode performance.
+p2p_port = 4001
+
+# -- Cryptography & Identity Settings --
+# The file path where the engine's encrypted node identity keypair will be stored.
+# Using a relative path like this will place it in the same directory where the engine is run.
+keys_path = "./aura_node_identity.key"
+
+# -- Bootstrap Node Settings --
+# A list of initial nodes to connect to when joining the AURA network for the first time.
+# These addresses would point to long-running, stable nodes maintained by NexusLabs or trusted community members.
+# The format is typically "/ip4/<IP_ADDRESS>/tcp/<PORT>/p2p/<PEER_ID>"
+bootstrap_nodes = [
+    # Example: "/ip4/192.168.1.100/tcp/4001/p2p/12D3KooWL7s3s3b4b..."
+]
+
+# -- Bluetooth Mesh Networking Settings --
+[mesh]
+# Service UUID for Aura mesh network discovery (Nordic UART Service UUID)
+service_uuid = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+# Maximum number of concurrent peer connections
+max_peers = 8
+# Connection timeout in seconds
+connection_timeout_secs = 30
+# Mesh message TTL (time-to-live) for hop limiting
+message_ttl = 5
+# Scan interval in milliseconds
+scan_interval_ms = 1000
+# Advertisement interval in milliseconds
+advertisement_interval_ms = 2000
+
+# -- Ronin Blockchain Settings --
+[ronin]
+# Ronin RPC endpoint URL
+rpc_url = "https://api.roninchain.com/rpc"
+# Chain ID for Ronin network (2020 for mainnet, 2021 for testnet)
+chain_id = 2020
+# Gas price in wei (20 gwei)
+gas_price = 20000000000
+# Gas limit for transactions
+gas_limit = 21000
+# Maximum offline transaction queue size
+max_offline_transactions = 1000
+# Transaction sync retry interval in seconds
+sync_retry_interval_secs = 60
+
+# -- Game-Specific Settings --
+[game]
+# Maximum number of players in a mesh game session
+max_players = 4
+# Game state sync interval in milliseconds
+sync_interval_ms = 100
+# Conflict resolution timeout in seconds
+conflict_resolution_timeout_secs = 10
+# Maximum game actions per player per second (rate limiting)
+max_actions_per_second = 10

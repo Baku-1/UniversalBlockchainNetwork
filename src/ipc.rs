@@ -1,0 +1,485 @@
+// src/ipc.rs
+
+use futures_util::{StreamExt, SinkExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::{accept_async, tungstenite::Message};
+use serde_json::json;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+/// Enhanced engine status for the UI
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EngineStatus {
+    pub is_connected: bool,
+    pub is_running: bool,
+    pub mode: String,
+    pub mesh_mode: bool,
+    pub node_id: String,
+
+    // Mesh networking
+    pub mesh_peers: Vec<MeshPeerInfo>,
+    pub total_peers: usize,
+    pub connected_peers: usize,
+
+    // Web3 Users state
+    pub validation_session: Option<String>,
+    pub web3_users: Vec<Web3UserInfo>,
+    pub total_users: usize,
+
+    // Blockchain/Web3
+    pub ronin_connected: bool,
+    pub ronin_block_number: Option<u64>,
+    pub ronin_gas_price: Option<u64>,
+    pub transaction_queue: usize,
+    pub pending_transactions: usize,
+    pub last_sync_time: Option<String>,
+
+    // Validation
+    pub last_task: String,
+    pub tasks_processed: u64,
+    pub validation_rate: f32,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MeshPeerInfo {
+    pub id: String,
+    pub is_connected: bool,
+    pub connection_quality: f32,
+    pub last_seen: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Web3UserInfo {
+    pub id: String,
+    pub is_online: bool,
+    pub address: String,
+    pub last_action: String,
+}
+
+impl Default for EngineStatus {
+    fn default() -> Self {
+        Self {
+            is_connected: true,
+            is_running: true,
+            mode: "Ready".to_string(),
+            mesh_mode: false,
+            node_id: "nexus_node_001".to_string(),
+            mesh_peers: vec![
+                // Demo data for visualization
+                MeshPeerInfo {
+                    id: "peer_001".to_string(),
+                    is_connected: true,
+                    connection_quality: 0.95,
+                    last_seen: "2024-01-01T00:00:00Z".to_string(),
+                },
+                MeshPeerInfo {
+                    id: "peer_002".to_string(),
+                    is_connected: false,
+                    connection_quality: 0.75,
+                    last_seen: "2024-01-01T00:00:00Z".to_string(),
+                },
+            ],
+            total_peers: 2,
+            connected_peers: 1,
+            validation_session: Some("validation_001".to_string()),
+            web3_users: vec![
+                Web3UserInfo {
+                    id: "user_001".to_string(),
+                    is_online: true,
+                    address: "0x1234567890123456789012345678901234567890".to_string(),
+                    last_action: "Validation".to_string(),
+                },
+            ],
+            total_users: 1,
+            ronin_connected: false,
+            ronin_block_number: None,
+            ronin_gas_price: None,
+            transaction_queue: 5,
+            pending_transactions: 3,
+            last_sync_time: None,
+            last_task: "Block Validation".to_string(),
+            tasks_processed: 42,
+            validation_rate: 15.5,
+        }
+    }
+}
+
+/// Global engine status
+static ENGINE_STATUS: once_cell::sync::Lazy<Arc<RwLock<EngineStatus>>> =
+    once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(EngineStatus::default())));
+
+pub async fn start_ipc_server(port: u16) {
+    let addr = format!("127.0.0.1:{}", port);
+    let listener = TcpListener::bind(&addr).await.expect("Failed to bind IPC server");
+    tracing::info!("Enhanced IPC Server listening on: ws://{}", addr);
+
+    while let Ok((stream, _)) = listener.accept().await {
+        tokio::spawn(handle_connection(stream));
+    }
+}
+
+async fn handle_connection(stream: TcpStream) {
+    if let Ok(websocket) = accept_async(stream).await {
+        tracing::info!("Web Portal connected to Nexus Engine.");
+        let (mut ws_sender, mut ws_receiver) = websocket.split();
+
+        // Send initial status
+        let status = ENGINE_STATUS.read().await.clone();
+        let initial_message = json!({
+            "type": "status",
+            "data": status
+        });
+
+        if let Err(e) = ws_sender.send(Message::Text(initial_message.to_string())).await {
+            tracing::error!("Failed to send initial status: {}", e);
+            return;
+        }
+
+        // Handle incoming messages
+        while let Some(msg_result) = ws_receiver.next().await {
+            match msg_result {
+                Ok(Message::Text(text)) => {
+                    tracing::debug!("Received from web portal: {}", text);
+
+                    let response = if let Ok(command) = serde_json::from_str::<serde_json::Value>(&text) {
+                        handle_command(command).await
+                    } else {
+                        // Handle simple text commands
+                        match text.as_str() {
+                            "status" => {
+                                let status = ENGINE_STATUS.read().await.clone();
+                                json!({
+                                    "type": "status",
+                                    "data": status
+                                }).to_string()
+                            }
+                            _ => json!({"type": "error", "message": "unknown_command"}).to_string(),
+                        }
+                    };
+
+                    if let Err(e) = ws_sender.send(Message::Text(response)).await {
+                        tracing::error!("Failed to send response: {}", e);
+                        break;
+                    }
+                }
+                Ok(Message::Close(_)) => {
+                    tracing::info!("WebSocket connection closed by client");
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!("WebSocket error: {}", e);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    tracing::info!("WebSocket connection ended");
+}
+
+async fn handle_command(command: serde_json::Value) -> String {
+    let cmd = command.get("command").and_then(|c| c.as_str()).unwrap_or("unknown");
+
+    match cmd {
+        "GetStatus" | "GetFullStatus" => {
+            let status = ENGINE_STATUS.read().await.clone();
+            json!({
+                "type": "status",
+                "data": status
+            }).to_string()
+        }
+        "ResumeEngine" => {
+            tracing::info!("Engine resume requested via IPC");
+            {
+                let mut status = ENGINE_STATUS.write().await;
+                status.is_running = true;
+            }
+            json!({"type": "command_response", "success": true}).to_string()
+        }
+        "PauseEngine" => {
+            tracing::info!("Engine pause requested via IPC");
+            {
+                let mut status = ENGINE_STATUS.write().await;
+                status.is_running = false;
+            }
+            json!({"type": "command_response", "success": true}).to_string()
+        }
+        "EnableMeshMode" => {
+            tracing::info!("Mesh mode enable requested via IPC");
+            {
+                let mut status = ENGINE_STATUS.write().await;
+                status.mesh_mode = true;
+                status.mode = "Mesh".to_string();
+            }
+            json!({"type": "command_response", "success": true}).to_string()
+        }
+        "DisableMeshMode" => {
+            tracing::info!("Mesh mode disable requested via IPC");
+            {
+                let mut status = ENGINE_STATUS.write().await;
+                status.mesh_mode = false;
+                status.mode = "P2P".to_string();
+            }
+            json!({"type": "command_response", "success": true}).to_string()
+        }
+        "ForceSync" => {
+            tracing::info!("Force sync requested via IPC");
+            {
+                let mut status = ENGINE_STATUS.write().await;
+                status.last_sync_time = Some(chrono::Utc::now().to_rfc3339());
+            }
+            json!({"type": "command_response", "success": true, "message": "Sync initiated"}).to_string()
+        }
+        "AddWeb3User" => {
+            tracing::info!("Adding Web3 user via IPC");
+            if let Some(user_data) = command.get("user") {
+                let mut status = ENGINE_STATUS.write().await;
+
+                // Create new Web3 user
+                let user = Web3UserInfo {
+                    id: user_data.get("id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+                    address: user_data.get("wallet").and_then(|v| v.as_str()).unwrap_or("0x0000000000000000000000000000000000000000").to_string(),
+                    is_online: true,
+                    last_action: format!("Joined mesh ({})", user_data.get("type").and_then(|v| v.as_str()).unwrap_or("unknown")),
+                };
+
+                // Add to users list
+                status.web3_users.push(user);
+                status.total_users = status.web3_users.len();
+
+                tracing::info!("Added Web3 user, total users: {}", status.total_users);
+            }
+            json!({"type": "command_response", "success": true}).to_string()
+        }
+        "StartValidation" => {
+            tracing::info!("Starting validation session via IPC");
+            if let Some(task_data) = command.get("task") {
+                let mut status = ENGINE_STATUS.write().await;
+                status.last_task = task_data.get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Validation Task")
+                    .to_string();
+                status.tasks_processed += 1;
+                status.validation_rate = 95.5; // Simulate high validation rate
+            }
+            json!({"type": "command_response", "success": true}).to_string()
+        }
+        "QueueTransaction" => {
+            tracing::info!("Queuing transaction via IPC");
+            {
+                let mut status = ENGINE_STATUS.write().await;
+                status.transaction_queue += 1;
+                status.pending_transactions += 1;
+            }
+            json!({"type": "command_response", "success": true}).to_string()
+        }
+        "ProcessTransaction" => {
+            tracing::info!("Processing transaction via IPC");
+            {
+                let mut status = ENGINE_STATUS.write().await;
+                if status.pending_transactions > 0 {
+                    status.pending_transactions -= 1;
+                }
+                if status.transaction_queue > 0 {
+                    status.transaction_queue -= 1;
+                }
+                status.last_sync_time = Some(chrono::Utc::now().to_rfc3339());
+            }
+            json!({"type": "command_response", "success": true}).to_string()
+        }
+        "GetRoninInfo" => {
+            tracing::info!("Ronin network info requested via IPC");
+            // This would be called with a reference to the RoninClient
+            // For now, return current status
+            let status = ENGINE_STATUS.read().await.clone();
+            json!({
+                "type": "ronin_info",
+                "data": {
+                    "connected": status.ronin_connected,
+                    "block_number": status.ronin_block_number,
+                    "gas_price": status.ronin_gas_price,
+                    "chain_id": 2020,
+                    "rpc_url": "https://api.roninchain.com/rpc"
+                }
+            }).to_string()
+        }
+        "EnableIdleValidation" => {
+            tracing::info!("Idle validation enabled via IPC - user device is idle");
+            {
+                let mut status = ENGINE_STATUS.write().await;
+                status.is_running = true;
+                status.mode = "Idle Validation".to_string();
+                status.validation_rate = 25.0; // Higher rate during idle
+            }
+            json!({"type": "command_response", "success": true, "message": "Idle validation enabled"}).to_string()
+        }
+        "DisableIdleValidation" => {
+            tracing::info!("Idle validation disabled via IPC - user is active");
+            {
+                let mut status = ENGINE_STATUS.write().await;
+                status.mode = if status.mesh_mode { "Mesh" } else { "Ready" }.to_string();
+                status.validation_rate = 15.5; // Normal rate when user is active
+            }
+            json!({"type": "command_response", "success": true, "message": "Idle validation disabled"}).to_string()
+        }
+        "RequestPermission" => {
+            tracing::info!("Permission request initiated via IPC");
+            json!({
+                "type": "permission_request",
+                "data": {
+                    "title": "Aura Validation Network - Permission Request",
+                    "description": "Allow this device to participate in Ronin blockchain validation and earn rewards?",
+                    "benefits": [
+                        "Earn $RON tokens for contributing idle resources",
+                        "Support offline Web3 gaming infrastructure",
+                        "Help secure the Ronin blockchain network",
+                        "Enable mesh networking for better connectivity"
+                    ],
+                    "privacy_guarantees": [
+                        "No access to personal files or browsing history",
+                        "Only uses idle system resources",
+                        "Secure, sandboxed execution environment",
+                        "Full user control with instant disable option"
+                    ]
+                }
+            }).to_string()
+        }
+        "EnableBluetoothMesh" => {
+            tracing::info!("Bluetooth mesh networking enabled via IPC");
+            {
+                let mut status = ENGINE_STATUS.write().await;
+                status.mesh_mode = true;
+                status.mode = "Bluetooth Mesh".to_string();
+                // Simulate discovering nearby devices
+                status.mesh_peers = vec![
+                    MeshPeerInfo {
+                        id: "mobile_001".to_string(),
+                        is_connected: true,
+                        connection_quality: 0.85,
+                        last_seen: chrono::Utc::now().to_rfc3339(),
+                    },
+                    MeshPeerInfo {
+                        id: "mobile_002".to_string(),
+                        is_connected: true,
+                        connection_quality: 0.92,
+                        last_seen: chrono::Utc::now().to_rfc3339(),
+                    },
+                ];
+                status.connected_peers = status.mesh_peers.len();
+                status.total_peers = status.mesh_peers.len();
+            }
+            json!({"type": "command_response", "success": true, "message": "Bluetooth mesh enabled"}).to_string()
+        }
+        "DisableBluetoothMesh" => {
+            tracing::info!("Bluetooth mesh networking disabled via IPC");
+            {
+                let mut status = ENGINE_STATUS.write().await;
+                status.mesh_mode = false;
+                status.mode = "WiFi Only".to_string();
+                status.mesh_peers.clear();
+                status.connected_peers = 0;
+                status.total_peers = 0;
+            }
+            json!({"type": "command_response", "success": true, "message": "Bluetooth mesh disabled"}).to_string()
+        }
+        "ScanNearbyDevices" => {
+            tracing::info!("Scanning for nearby Bluetooth devices via IPC");
+            // Simulate device discovery
+            let nearby_devices = vec![
+                json!({
+                    "id": "device_001",
+                    "name": "Gaming Phone",
+                    "type": "mobile",
+                    "signal_strength": -45,
+                    "aura_enabled": true,
+                    "connected": false
+                }),
+                json!({
+                    "id": "device_002",
+                    "name": "Tablet Pro",
+                    "type": "tablet",
+                    "signal_strength": -52,
+                    "aura_enabled": true,
+                    "connected": false
+                }),
+                json!({
+                    "id": "device_003",
+                    "name": "Laptop",
+                    "type": "desktop",
+                    "signal_strength": -38,
+                    "aura_enabled": true,
+                    "connected": false
+                })
+            ];
+
+            json!({
+                "type": "nearby_devices",
+                "data": {
+                    "devices": nearby_devices,
+                    "scan_complete": true,
+                    "timestamp": chrono::Utc::now().to_rfc3339()
+                }
+            }).to_string()
+        }
+        "ConnectToDevice" => {
+            tracing::info!("Connecting to Bluetooth device via IPC");
+            if let Some(device_id) = command.get("device_id").and_then(|v| v.as_str()) {
+                let mut status = ENGINE_STATUS.write().await;
+
+                // Add new peer to mesh
+                let new_peer = MeshPeerInfo {
+                    id: device_id.to_string(),
+                    is_connected: true,
+                    connection_quality: 0.88,
+                    last_seen: chrono::Utc::now().to_rfc3339(),
+                };
+
+                status.mesh_peers.push(new_peer);
+                status.connected_peers = status.mesh_peers.len();
+                status.total_peers = status.mesh_peers.len();
+
+                json!({
+                    "type": "device_connected",
+                    "data": {
+                        "device_id": device_id,
+                        "success": true,
+                        "message": "Device connected to mesh"
+                    }
+                }).to_string()
+            } else {
+                json!({"type": "error", "message": "Device ID required"}).to_string()
+            }
+        }
+        "GetMeshStatus" => {
+            tracing::info!("Mesh network status requested via IPC");
+            let status = ENGINE_STATUS.read().await.clone();
+            json!({
+                "type": "mesh_status",
+                "data": {
+                    "mesh_enabled": status.mesh_mode,
+                    "connected_peers": status.connected_peers,
+                    "total_peers": status.total_peers,
+                    "mesh_peers": status.mesh_peers,
+                    "network_quality": if status.connected_peers > 0 {
+                        status.mesh_peers.iter().map(|p| p.connection_quality).sum::<f32>() / status.mesh_peers.len() as f32
+                    } else { 0.0 },
+                    "is_mobile": true, // This would be detected from user agent
+                    "bluetooth_available": true
+                }
+            }).to_string()
+        }
+        _ => {
+            json!({"type": "error", "message": "Unknown command"}).to_string()
+        }
+    }
+}
+
+/// Update engine status (called from other modules)
+pub async fn update_engine_status<F>(updater: F)
+where
+    F: FnOnce(&mut EngineStatus),
+{
+    let mut status = ENGINE_STATUS.write().await;
+    updater(&mut *status);
+}
