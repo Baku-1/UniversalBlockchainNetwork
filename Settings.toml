@@ -25,6 +25,11 @@ bootstrap_nodes = [
     # Example: "/ip4/192.168.1.100/tcp/4001/p2p/12D3KooWL7s3s3b4b..."
 ]
 
+# -- AuraProtocol Contract Settings --
+# The deployed AuraProtocol contract address on Ronin blockchain
+# Leave commented out to run without contract integration
+# aura_protocol_address = "0x1234567890123456789012345678901234567890"
+
 # -- Bluetooth Mesh Networking Settings --
 [mesh]
 # Service UUID for Aura mesh network discovery (Nordic UART Service UUID)

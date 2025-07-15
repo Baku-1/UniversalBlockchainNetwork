@@ -4,6 +4,10 @@ version = "0.0.1"
 edition = "2021"
 description = "Ronin Blockchain Mesh Utility for Offline Transactions"
 
+[lib]
+name = "aura_validation_network"
+path = "src/lib.rs"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -11,7 +15,7 @@ description = "Ronin Blockchain Mesh Utility for Offline Transactions"
 tokio = { version = "1", features = ["full"] }
 
 # Foundational library for building peer-to-peer networks
-libp2p = { version = "0.53", features = ["tokio", "gossipsub", "mdns", "tcp"] }
+libp2p = { version = "0.53", features = ["tokio", "gossipsub", "mdns", "tcp", "noise", "yamux", "macros"] }
 
 # Bluetooth Low Energy (BLE) library for mesh networking
 btleplug = { version = "0.11", features = ["serde"] }
@@ -46,6 +50,8 @@ anyhow = "1.0" # Flexible error handling
 hex = "0.4" # Hexadecimal encoding/decoding
 once_cell = "1.19" # Global static variables
 chrono = { version = "0.4", features = ["serde"] } # Date and time handling
+
+
 
 [dev-dependencies]
 tempfile = "3.0" # Temporary files for testing

@@ -104,7 +104,7 @@ pub struct NetworkInfo {
 /// Ronin blockchain client for Web3 operations
 pub struct RoninClient {
     config: RoninConfig,
-    provider: Arc<Provider<Http>>,
+    pub provider: Arc<Provider<Http>>,
     chain_id: u64,
 }
 
@@ -357,7 +357,7 @@ pub mod utils {
     ) -> RoninTransaction {
         // TODO: Encode ERC-721 transferFrom call data
         let call_data = encode_transfer_from(&from, &to, token_id);
-        
+
         RoninTransaction {
             id: Uuid::new_v4(),
             from,
@@ -395,4 +395,5 @@ pub mod utils {
     pub fn ron_to_wei(ron: f64) -> u64 {
         (ron * 1_000_000_000_000_000_000.0) as u64
     }
+
 }

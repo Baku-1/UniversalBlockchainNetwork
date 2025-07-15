@@ -9,15 +9,20 @@ use uuid::Uuid;
 use anyhow::Result;
 use crate::web3::{RoninClient, RoninTransaction, TransactionStatus};
 use crate::transaction_queue::OfflineTransactionQueue;
-use crate::mesh_validation::{MeshTransaction, TokenType};
+use crate::mesh_validation::{MeshTransaction, TokenType, MeshValidator};
+use crate::aura_protocol::{AuraProtocolClient, ValidationTask, ContractEvent};
 
-/// Bridge node for settling mesh transactions on Ronin blockchain
+/// Bridge node for settling mesh transactions and handling contract interactions
 pub struct BridgeNode {
     ronin_client: Arc<RoninClient>,
     transaction_queue: Arc<OfflineTransactionQueue>,
     settlement_batch: Arc<RwLock<Vec<MeshTransaction>>>,
     settlement_stats: Arc<RwLock<SettlementStats>>,
     bridge_events: mpsc::Sender<BridgeEvent>,
+    // Contract integration
+    aura_protocol_client: Option<Arc<AuraProtocolClient>>,
+    mesh_validator: Option<Arc<MeshValidator>>,
+    contract_task_queue: Arc<RwLock<Vec<ValidationTask>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +31,10 @@ pub enum BridgeEvent {
     MeshTransactionSettled(Uuid),
     SettlementFailed(Uuid, String),
     BatchSettlementCompleted(usize),
+    ContractTaskReceived(u64),
+    ContractTaskProcessed(u64),
+    ContractResultSubmitted(u64, String),
+    ContractEventProcessed(String),
 }
 
 #[derive(Debug, Default, Clone)]
@@ -35,6 +44,14 @@ pub struct SettlementStats {
     pub failed_settlements: u64,
     pub last_settlement_time: Option<SystemTime>,
     pub pending_settlements: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ContractTaskStats {
+    pub active_tasks: usize,
+    pub total_processed: u64,
+    pub successful_submissions: u64,
+    pub failed_submissions: u64,
 }
 
 /// Settlement transaction that aggregates mesh transactions
@@ -62,14 +79,27 @@ impl BridgeNode {
         transaction_queue: Arc<OfflineTransactionQueue>,
     ) -> Self {
         let (bridge_events, _) = mpsc::channel(100);
-        
+
         Self {
             ronin_client,
             transaction_queue,
             settlement_batch: Arc::new(RwLock::new(Vec::new())),
             settlement_stats: Arc::new(RwLock::new(SettlementStats::default())),
             bridge_events,
+            aura_protocol_client: None,
+            mesh_validator: None,
+            contract_task_queue: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// Set the AuraProtocol client for contract interactions
+    pub fn set_aura_protocol_client(&mut self, client: Arc<AuraProtocolClient>) {
+        self.aura_protocol_client = Some(client);
+    }
+
+    /// Set the mesh validator for processing contract tasks
+    pub fn set_mesh_validator(&mut self, validator: Arc<MeshValidator>) {
+        self.mesh_validator = Some(validator);
     }
 
     /// Start the bridge service
@@ -88,6 +118,14 @@ impl BridgeNode {
     async fn bridge_loop(&self, event_tx: mpsc::Sender<BridgeEvent>) {
         let mut connectivity_check_interval = tokio::time::interval(Duration::from_secs(30));
         let mut settlement_interval = tokio::time::interval(Duration::from_secs(300)); // 5 minutes
+        let mut contract_task_interval = tokio::time::interval(Duration::from_secs(60)); // 1 minute
+
+        // Start contract event monitoring if available
+        let mut contract_events_rx = if let Some(client) = &self.aura_protocol_client {
+            Some(client.start_event_monitor().await)
+        } else {
+            None
+        };
 
         loop {
             tokio::select! {
@@ -96,7 +134,7 @@ impl BridgeNode {
                         let _ = event_tx.send(BridgeEvent::ConnectivityRestored).await;
                     }
                 }
-                
+
                 _ = settlement_interval.tick() => {
                     if self.ronin_client.check_connectivity().await {
                         if let Err(e) = self.process_settlement_batch().await {
@@ -105,6 +143,35 @@ impl BridgeNode {
                         }
                     }
                 }
+
+                _ = contract_task_interval.tick() => {
+                    if self.ronin_client.check_connectivity().await {
+                        if let Err(e) = self.process_contract_tasks().await {
+                            tracing::error!("Contract task processing failed: {}", e);
+                        }
+                    }
+                }
+
+                contract_event = Self::recv_contract_event(&mut contract_events_rx) => {
+                    if let Some(event) = contract_event {
+                        if let Err(e) = self.handle_contract_event(event, &event_tx).await {
+                            tracing::error!("Failed to handle contract event: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Helper function to receive contract events
+    async fn recv_contract_event(
+        contract_events_rx: &mut Option<mpsc::Receiver<ContractEvent>>
+    ) -> Option<ContractEvent> {
+        match contract_events_rx {
+            Some(rx) => rx.recv().await,
+            None => {
+                // Return None immediately if no receiver
+                None
             }
         }
     }
@@ -315,6 +382,167 @@ impl BridgeNode {
             Err(anyhow::anyhow!("No connectivity to Ronin network"))
         }
     }
+
+    // === Contract Task Processing Methods ===
+
+    /// Process contract validation tasks
+    async fn process_contract_tasks(&self) -> Result<()> {
+        let client = match &self.aura_protocol_client {
+            Some(client) => client,
+            None => return Ok(()), // No contract client configured
+        };
+
+        let validator = match &self.mesh_validator {
+            Some(validator) => validator,
+            None => return Ok(()), // No mesh validator configured
+        };
+
+        // Fetch open tasks from the contract
+        let open_tasks = client.get_open_tasks().await?;
+
+        for task in open_tasks {
+            // Check if this node is part of the worker cohort
+            if client.is_node_in_cohort(&task) {
+                // Check if we're already processing this task
+                let active_tasks = validator.get_active_contract_tasks().await;
+                if !active_tasks.iter().any(|t| t.id == task.id) {
+                    tracing::info!("Processing new contract task: {}", task.id);
+
+                    // Process the task through mesh validation
+                    let task_success = match validator.process_contract_task(task.clone()).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::error!("Failed to process contract task {}: {}", task.id, e);
+                            false
+                        }
+                    };
+
+                    if task_success {
+                        let _ = self.bridge_events.send(BridgeEvent::ContractTaskReceived(task.id)).await;
+                    }
+                }
+            }
+        }
+
+        // Check for completed tasks ready for submission
+        self.submit_completed_contract_tasks().await?;
+
+        Ok(())
+    }
+
+    /// Submit completed contract task results
+    async fn submit_completed_contract_tasks(&self) -> Result<()> {
+        let client = match &self.aura_protocol_client {
+            Some(client) => client,
+            None => return Ok(()),
+        };
+
+        let validator = match &self.mesh_validator {
+            Some(validator) => validator,
+            None => return Ok(()),
+        };
+
+        let active_tasks = validator.get_active_contract_tasks().await;
+
+        for task in active_tasks {
+            // Check if we have a completed result ready for submission
+            if let Some(result) = validator.get_contract_task_result(task.id).await {
+                tracing::info!("Submitting result for contract task: {}", task.id);
+
+                match client.submit_result(result).await {
+                    Ok(tx_hash) => {
+                        tracing::info!("Contract task {} result submitted: {}", task.id, tx_hash);
+
+                        // Remove the completed task
+                        validator.remove_contract_task(task.id).await;
+
+                        let _ = self.bridge_events.send(BridgeEvent::ContractResultSubmitted(task.id, tx_hash)).await;
+                        let _ = self.bridge_events.send(BridgeEvent::ContractTaskProcessed(task.id)).await;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to submit result for task {}: {}", task.id, e);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle contract events
+    async fn handle_contract_event(
+        &self,
+        event: ContractEvent,
+        event_tx: &mpsc::Sender<BridgeEvent>,
+    ) -> Result<()> {
+        match event {
+            ContractEvent::TaskCreated { task_id, requester, bounty, task_data: _, deadline: _ } => {
+                tracing::info!("New contract task created: {} by {} with bounty {}",
+                    task_id, requester, bounty);
+
+                let _ = event_tx.send(BridgeEvent::ContractEventProcessed(
+                    format!("TaskCreated:{}", task_id)
+                )).await;
+            }
+
+            ContractEvent::TaskCompleted { task_id } => {
+                tracing::info!("Contract task completed: {}", task_id);
+
+                // Clean up any local state for this task
+                if let Some(validator) = &self.mesh_validator {
+                    validator.remove_contract_task(task_id).await;
+                }
+
+                let _ = event_tx.send(BridgeEvent::ContractEventProcessed(
+                    format!("TaskCompleted:{}", task_id)
+                )).await;
+            }
+
+            ContractEvent::TaskFailed { task_id } => {
+                tracing::warn!("Contract task failed: {}", task_id);
+
+                // Clean up any local state for this task
+                if let Some(validator) = &self.mesh_validator {
+                    validator.remove_contract_task(task_id).await;
+                }
+
+                let _ = event_tx.send(BridgeEvent::ContractEventProcessed(
+                    format!("TaskFailed:{}", task_id)
+                )).await;
+            }
+
+            ContractEvent::TaskCancelled { task_id, reason } => {
+                tracing::info!("Contract task cancelled: {} - {}", task_id, reason);
+
+                // Clean up any local state for this task
+                if let Some(validator) = &self.mesh_validator {
+                    validator.remove_contract_task(task_id).await;
+                }
+
+                let _ = event_tx.send(BridgeEvent::ContractEventProcessed(
+                    format!("TaskCancelled:{}", task_id)
+                )).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get contract task processing statistics
+    pub async fn get_contract_task_stats(&self) -> Option<ContractTaskStats> {
+        if let Some(validator) = &self.mesh_validator {
+            let active_tasks = validator.get_active_contract_tasks().await;
+
+            Some(ContractTaskStats {
+                active_tasks: active_tasks.len(),
+                total_processed: 0, // Would need to track this
+                successful_submissions: 0, // Would need to track this
+                failed_submissions: 0, // Would need to track this
+            })
+        } else {
+            None
+        }
+    }
 }
 
 impl Clone for BridgeNode {
@@ -325,6 +553,9 @@ impl Clone for BridgeNode {
             settlement_batch: Arc::clone(&self.settlement_batch),
             settlement_stats: Arc::clone(&self.settlement_stats),
             bridge_events: self.bridge_events.clone(),
+            aura_protocol_client: self.aura_protocol_client.clone(),
+            mesh_validator: self.mesh_validator.clone(),
+            contract_task_queue: Arc::clone(&self.contract_task_queue),
         }
     }
 }

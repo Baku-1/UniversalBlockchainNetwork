@@ -8,6 +8,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 use crate::crypto::NodeKeypair;
 use crate::config::RoninConfig;
+use crate::aura_protocol::{ValidationTask, TaskResult as ContractTaskResult, TaskStatus};
 
 /// Mesh transaction that can be processed between mesh participants
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,7 +55,7 @@ pub struct ValidationResult {
     pub timestamp: SystemTime,
 }
 
-/// Mesh validator for processing peer-to-peer transactions
+/// Mesh validator for processing peer-to-peer transactions and contract tasks
 pub struct MeshValidator {
     node_keys: NodeKeypair,
     config: RoninConfig,
@@ -62,6 +63,10 @@ pub struct MeshValidator {
     validation_results: Arc<RwLock<HashMap<Uuid, Vec<ValidationResult>>>>,
     user_balances: Arc<RwLock<HashMap<String, UserBalance>>>, // Track mesh balances
     validation_events: mpsc::Sender<ValidationEvent>,
+    // Contract task validation
+    active_contract_tasks: Arc<RwLock<HashMap<u64, ValidationTask>>>,
+    contract_task_signatures: Arc<RwLock<HashMap<u64, HashMap<String, Vec<u8>>>>>, // task_id -> (node_id -> signature)
+    contract_task_results: Arc<RwLock<HashMap<u64, Vec<u8>>>>, // task_id -> result_data
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,13 +93,16 @@ pub enum ValidationEvent {
     TransactionExecuted(Uuid),
     TransactionRejected(Uuid, String),
     BalanceUpdated(String),
+    ContractTaskReceived(u64),
+    ContractTaskCompleted(u64, bool),
+    ContractTaskSignatureCollected(u64, String),
 }
 
 impl MeshValidator {
     /// Create a new mesh validator
     pub fn new(node_keys: NodeKeypair, config: RoninConfig) -> Self {
         let (validation_events, _) = mpsc::channel(100);
-        
+
         Self {
             node_keys,
             config,
@@ -102,6 +110,9 @@ impl MeshValidator {
             validation_results: Arc::new(RwLock::new(HashMap::new())),
             user_balances: Arc::new(RwLock::new(HashMap::new())),
             validation_events,
+            active_contract_tasks: Arc::new(RwLock::new(HashMap::new())),
+            contract_task_signatures: Arc::new(RwLock::new(HashMap::new())),
+            contract_task_results: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -345,6 +356,208 @@ impl MeshValidator {
             .filter(|tx| tx.status == MeshTransactionStatus::Validated)
             .cloned()
             .collect()
+    }
+
+    // === Contract Task Validation Methods ===
+
+    /// Process a new contract validation task
+    pub async fn process_contract_task(
+        &self,
+        task: ValidationTask,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        tracing::info!("Processing contract validation task: {}", task.id);
+
+        // Check if this node is part of the worker cohort
+        let node_id = self.node_keys.node_id();
+        if !task.worker_cohort.contains(&node_id) {
+            return Err("Node not in worker cohort for this task".into());
+        }
+
+        // Check if task is still open
+        if task.status != TaskStatus::Open {
+            return Err("Task is not open for validation".into());
+        }
+
+        // Check if task has expired
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if now > task.submission_deadline {
+            return Err("Task has expired".into());
+        }
+
+        // Add to active tasks
+        {
+            let mut active = self.active_contract_tasks.write().await;
+            active.insert(task.id, task.clone());
+        }
+
+        // Start validation process
+        let validation_result = self.validate_contract_task(&task).await?;
+
+        // Store the result
+        {
+            let mut results = self.contract_task_results.write().await;
+            results.insert(task.id, validation_result.clone());
+        }
+
+        // Create and store signature
+        let signature = self.sign_contract_task_result(task.id, &validation_result).await?;
+        {
+            let mut signatures = self.contract_task_signatures.write().await;
+            signatures.entry(task.id).or_insert_with(HashMap::new)
+                .insert(node_id.clone(), signature);
+        }
+
+        let _ = self.validation_events.send(ValidationEvent::ContractTaskReceived(task.id)).await;
+        let _ = self.validation_events.send(ValidationEvent::ContractTaskSignatureCollected(task.id, node_id)).await;
+
+        Ok(())
+    }
+
+    /// Validate a contract task and produce result data
+    async fn validate_contract_task(
+        &self,
+        task: &ValidationTask,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        tracing::debug!("Validating contract task {} with data length: {}", task.id, task.task_data.len());
+
+        // For now, we'll implement a simple validation that processes the task data
+        // In a real implementation, this would depend on the specific task type
+
+        // Example validation: hash the task data and return it as the result
+        let result_data = crate::crypto::hash_data(&task.task_data);
+
+        // Simulate some processing time
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        tracing::debug!("Contract task {} validation completed", task.id);
+        Ok(result_data)
+    }
+
+    /// Sign a contract task result
+    async fn sign_contract_task_result(
+        &self,
+        task_id: u64,
+        result_data: &[u8],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        // Create the data to sign (task_id + result_hash)
+        let mut sign_data = Vec::new();
+        sign_data.extend_from_slice(&task_id.to_be_bytes());
+        sign_data.extend_from_slice(result_data);
+
+        // Sign with node's private key
+        let signature = self.node_keys.sign(&sign_data);
+        Ok(signature)
+    }
+
+    /// Collect signatures from other mesh nodes for a contract task
+    pub async fn add_contract_task_signature(
+        &self,
+        task_id: u64,
+        node_id: String,
+        signature: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        {
+            let mut signatures = self.contract_task_signatures.write().await;
+            signatures.entry(task_id).or_insert_with(HashMap::new)
+                .insert(node_id.clone(), signature);
+        }
+
+        let _ = self.validation_events.send(ValidationEvent::ContractTaskSignatureCollected(task_id, node_id)).await;
+
+        // Check if we have enough signatures to submit
+        self.check_contract_task_completion(task_id).await?;
+
+        Ok(())
+    }
+
+    /// Check if a contract task has enough signatures to be submitted
+    async fn check_contract_task_completion(&self, task_id: u64) -> Result<(), Box<dyn std::error::Error>> {
+        let (task, signatures, result) = {
+            let active = self.active_contract_tasks.read().await;
+            let sigs = self.contract_task_signatures.read().await;
+            let results = self.contract_task_results.read().await;
+
+            let task = active.get(&task_id).cloned();
+            let signatures = sigs.get(&task_id).cloned().unwrap_or_default();
+            let result = results.get(&task_id).cloned();
+
+            (task, signatures, result)
+        };
+
+        if let (Some(task), Some(_result_data)) = (task, result) {
+            let cohort_size = task.worker_cohort.len();
+            let signature_count = signatures.len();
+
+            // Calculate required signatures (simple majority for now)
+            let required_signatures = (cohort_size / 2) + 1;
+
+            if signature_count >= required_signatures {
+                tracing::info!("Contract task {} has sufficient signatures ({}/{})",
+                    task_id, signature_count, cohort_size);
+
+                let _ = self.validation_events.send(ValidationEvent::ContractTaskCompleted(task_id, true)).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get contract task result ready for submission
+    pub async fn get_contract_task_result(&self, task_id: u64) -> Option<ContractTaskResult> {
+        let (task, signatures, result) = {
+            let active = self.active_contract_tasks.read().await;
+            let sigs = self.contract_task_signatures.read().await;
+            let results = self.contract_task_results.read().await;
+
+            let task = active.get(&task_id).cloned()?;
+            let signatures = sigs.get(&task_id).cloned().unwrap_or_default();
+            let result = results.get(&task_id).cloned()?;
+
+            (task, signatures, result)
+        };
+
+        // Check if we have enough signatures
+        let required_signatures = (task.worker_cohort.len() / 2) + 1;
+        if signatures.len() >= required_signatures {
+            let signature_vec: Vec<Vec<u8>> = signatures.values().cloned().collect();
+            let signers: Vec<String> = signatures.keys().cloned().collect();
+
+            Some(ContractTaskResult {
+                task_id,
+                result_data: result,
+                signatures: signature_vec,
+                signers,
+                mesh_validation_id: task.mesh_task_id.unwrap_or_else(|| Uuid::new_v4()),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Get all active contract tasks
+    pub async fn get_active_contract_tasks(&self) -> Vec<ValidationTask> {
+        let active = self.active_contract_tasks.read().await;
+        active.values().cloned().collect()
+    }
+
+    /// Remove a completed contract task
+    pub async fn remove_contract_task(&self, task_id: u64) {
+        {
+            let mut active = self.active_contract_tasks.write().await;
+            active.remove(&task_id);
+        }
+        {
+            let mut signatures = self.contract_task_signatures.write().await;
+            signatures.remove(&task_id);
+        }
+        {
+            let mut results = self.contract_task_results.write().await;
+            results.remove(&task_id);
+        }
     }
 
     /// Get user balance

@@ -1,0 +1,51 @@
+{
+  "name": "aura-validation-network",
+  "version": "0.0.1",
+  "description": "Ronin Blockchain Mesh Utility for Offline Transactions - Smart Contract Deployment",
+  "main": "index.js",
+  "scripts": {
+    "compile": "hardhat compile",
+    "deploy:testnet": "hardhat run scripts/deploy.js --network ronin-testnet",
+    "deploy:mainnet": "hardhat run scripts/deploy.js --network ronin-mainnet",
+    "verify": "hardhat verify --network ronin-testnet",
+    "test": "hardhat test",
+    "node": "hardhat node"
+  },
+  "keywords": [
+    "ronin",
+    "blockchain",
+    "mesh",
+    "validation",
+    "web3",
+    "aura"
+  ],
+  "author": "AuraValidationNetwork",
+  "license": "MIT",
+  "devDependencies": {
+    "@ethersproject/providers": "^5.8.0",
+    "@nomicfoundation/hardhat-chai-matchers": "^1.0.6",
+    "@nomicfoundation/hardhat-network-helpers": "^1.0.13",
+    "@nomicfoundation/hardhat-toolbox": "^2.0.0",
+    "@nomicfoundation/hardhat-verify": "^1.0.0",
+    "@nomiclabs/hardhat-ethers": "^2.2.3",
+    "@nomiclabs/hardhat-etherscan": "^3.1.8",
+    "@openzeppelin/hardhat-upgrades": "^1.28.0",
+    "@typechain/ethers-v5": "^10.2.1",
+    "@typechain/hardhat": "^6.1.6",
+    "@types/chai": "^4.3.20",
+    "@types/mocha": "^10.0.10",
+    "chai": "^4.5.0",
+    "ethers": "^5.8.0",
+    "hardhat": "^2.17.0",
+    "hardhat-gas-reporter": "^1.0.10",
+    "solidity-coverage": "^0.8.16",
+    "ts-node": "^10.9.2",
+    "typechain": "^8.3.2",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^4.9.6",
+    "@openzeppelin/contracts-upgradeable": "4.9.6",
+    "dotenv": "^16.3.0"
+  }
+}

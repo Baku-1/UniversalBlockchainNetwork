@@ -13,6 +13,9 @@ pub struct AppConfig {
     pub keys_path: PathBuf,
     pub bootstrap_nodes: Vec<String>,
 
+    // AuraProtocol contract address (optional)
+    pub aura_protocol_address: Option<String>,
+
     // Bluetooth mesh networking configuration
     pub mesh: MeshConfig,
 
@@ -77,6 +80,7 @@ impl Default for AppConfig {
             p2p_port: 4001,
             keys_path: PathBuf::from("./aura_node_identity.key"),
             bootstrap_nodes: vec![],
+            aura_protocol_address: None,
             mesh: MeshConfig::default(),
             ronin: RoninConfig::default(),
             game: GameConfig::default(),

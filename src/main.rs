@@ -16,6 +16,7 @@ mod mesh;
 mod mesh_topology;
 mod mesh_routing;
 mod errors;
+mod aura_protocol;
 
 // Re-export public APIs for external use
 pub use config::*;
@@ -27,6 +28,7 @@ pub use transaction_queue::*;
 pub use web3::{RoninClient, RoninTransaction, TransactionStatus};
 pub use mesh_topology::*;
 pub use errors::{NexusError, ErrorContext};
+pub use aura_protocol::{AuraProtocolClient, ValidationTask, TaskStatus, TaskResult};
 
 use tokio::sync::mpsc;
 use std::sync::Arc;
@@ -114,19 +116,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Ronin connectivity monitor started");
 
     // Initialize mesh validation system
-    let _mesh_validator = Arc::new(mesh_validation::MeshValidator::new(
+    let mesh_validator = Arc::new(mesh_validation::MeshValidator::new(
         node_keys.clone(),
         app_config.ronin.clone(),
     ));
     tracing::info!("Mesh validator initialized");
 
+    // Initialize AuraProtocol contract client (if contract address is configured)
+    let aura_protocol_client = if let Some(contract_address) = app_config.aura_protocol_address.as_ref() {
+        match contract_address.parse() {
+            Ok(address) => {
+                match aura_protocol::AuraProtocolClient::new(
+                    address,
+                    Arc::clone(&connectivity_monitor),
+                    node_keys.clone(),
+                    app_config.ronin.clone(),
+                ) {
+                    Ok(client) => {
+                        tracing::info!("AuraProtocol client initialized at address: {}", contract_address);
+                        Some(Arc::new(client))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to initialize AuraProtocol client: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Invalid AuraProtocol contract address: {}", e);
+                None
+            }
+        }
+    } else {
+        tracing::info!("No AuraProtocol contract address configured, running without contract integration");
+        None
+    };
+
     // Initialize bridge node for blockchain settlement
-    let bridge_node = Arc::new(bridge_node::BridgeNode::new(
+    let mut bridge_node = bridge_node::BridgeNode::new(
         Arc::clone(&connectivity_monitor),
         Arc::clone(&transaction_queue),
-    ));
+    );
+
+    // Configure bridge node with contract integration
+    if let Some(client) = aura_protocol_client.as_ref() {
+        bridge_node.set_aura_protocol_client(Arc::clone(client));
+    }
+    bridge_node.set_mesh_validator(Arc::clone(&mesh_validator));
+
+    let bridge_node = Arc::new(bridge_node);
     let mut bridge_events = bridge_node.start_bridge_service().await;
-    tracing::info!("Bridge node started");
+    tracing::info!("Bridge node started with contract integration");
 
     // Initialize store & forward system
     let store_forward = Arc::new(store_forward::StoreForwardManager::new(
@@ -218,6 +258,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     bridge_node::BridgeEvent::BatchSettlementCompleted(count) => {
                         tracing::info!("Batch settlement completed: {} transactions", count);
+                    }
+                    bridge_node::BridgeEvent::ContractTaskReceived(task_id) => {
+                        tracing::info!("Contract validation task {} received", task_id);
+                    }
+                    bridge_node::BridgeEvent::ContractTaskProcessed(task_id) => {
+                        tracing::info!("Contract validation task {} processed", task_id);
+                    }
+                    bridge_node::BridgeEvent::ContractResultSubmitted(task_id, tx_hash) => {
+                        tracing::info!("Contract task {} result submitted: {}", task_id, tx_hash);
+                    }
+                    bridge_node::BridgeEvent::ContractEventProcessed(event_type) => {
+                        tracing::debug!("Contract event processed: {}", event_type);
                     }
                 }
             }
