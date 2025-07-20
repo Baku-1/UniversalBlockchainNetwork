@@ -92,12 +92,15 @@ pub enum NexusError {
     StateMergeConflict(String),
 
     // Validation errors
+    #[error("Validation error: {0}")]
+    ValidationError(String),
+
     #[error("Block validation failed: {block_id}")]
     BlockValidation { block_id: String },
-    
+
     #[error("Computation task failed: {task_id}")]
     ComputationTaskFailed { task_id: Uuid },
-    
+
     #[error("Validator overloaded: {pending_tasks} tasks pending")]
     ValidatorOverloaded { pending_tasks: usize },
 
@@ -147,7 +150,7 @@ pub enum NexusError {
 }
 
 /// Result type alias for Nexus operations
-pub type NexusResult<T> = Result<T, NexusError>;
+pub type NexusResult<T> = std::result::Result<T, NexusError>;
 
 /// Error context for better error reporting
 #[derive(Debug, Clone)]
@@ -213,11 +216,11 @@ impl std::error::Error for ContextualError {
 
 /// Trait for adding context to errors
 pub trait ErrorContextExt<T> {
-    fn with_context(self, context: ErrorContext) -> Result<T, ContextualError>;
+    fn with_context(self, context: ErrorContext) -> std::result::Result<T, ContextualError>;
 }
 
 impl<T> ErrorContextExt<T> for NexusResult<T> {
-    fn with_context(self, context: ErrorContext) -> Result<T, ContextualError> {
+    fn with_context(self, context: ErrorContext) -> std::result::Result<T, ContextualError> {
         self.map_err(|error| ContextualError { error, context })
     }
 }
@@ -300,3 +303,6 @@ pub mod utils {
         }
     }
 }
+
+/// Result type alias for convenience
+pub type Result<T> = std::result::Result<T, NexusError>;

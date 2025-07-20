@@ -11,6 +11,7 @@ use crate::web3::{RoninClient, RoninTransaction, TransactionStatus};
 use crate::transaction_queue::OfflineTransactionQueue;
 use crate::mesh_validation::{MeshTransaction, TokenType, MeshValidator};
 use crate::aura_protocol::{AuraProtocolClient, ValidationTask, ContractEvent};
+use crate::contract_integration::ContractIntegration;
 
 /// Bridge node for settling mesh transactions and handling contract interactions
 pub struct BridgeNode {
@@ -21,6 +22,7 @@ pub struct BridgeNode {
     bridge_events: mpsc::Sender<BridgeEvent>,
     // Contract integration
     aura_protocol_client: Option<Arc<AuraProtocolClient>>,
+    contract_integration: Option<Arc<ContractIntegration>>,
     mesh_validator: Option<Arc<MeshValidator>>,
     contract_task_queue: Arc<RwLock<Vec<ValidationTask>>>,
 }
@@ -87,6 +89,7 @@ impl BridgeNode {
             settlement_stats: Arc::new(RwLock::new(SettlementStats::default())),
             bridge_events,
             aura_protocol_client: None,
+            contract_integration: None,
             mesh_validator: None,
             contract_task_queue: Arc::new(RwLock::new(Vec::new())),
         }
@@ -95,6 +98,11 @@ impl BridgeNode {
     /// Set the AuraProtocol client for contract interactions
     pub fn set_aura_protocol_client(&mut self, client: Arc<AuraProtocolClient>) {
         self.aura_protocol_client = Some(client);
+    }
+
+    /// Set the contract integration for AuraProtocol interactions
+    pub fn set_contract_integration(&mut self, integration: Arc<ContractIntegration>) {
+        self.contract_integration = Some(integration);
     }
 
     /// Set the mesh validator for processing contract tasks
@@ -543,6 +551,54 @@ impl BridgeNode {
             None
         }
     }
+
+
+
+    /// Submit contract task results
+    pub async fn submit_contract_results(&self) -> Result<()> {
+        if let Some(contract_integration) = &self.contract_integration {
+            let pending_results = contract_integration.get_pending_results().await;
+
+            for result in pending_results {
+                tracing::info!("Submitting contract result for task {} from bridge", result.task_id);
+
+                match contract_integration.submit_task_result(result.clone()).await {
+                    Ok(tx_hash) => {
+                        // Remove from pending
+                        contract_integration.remove_pending_result(result.task_id).await?;
+
+                        // Send bridge event
+                        let _ = self.bridge_events.send(
+                            BridgeEvent::ContractResultSubmitted(result.task_id, tx_hash)
+                        ).await;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to submit contract result for task {}: {}", result.task_id, e);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+
+
+    /// Get contract integration statistics
+    pub async fn get_contract_stats(&self) -> Option<HashMap<String, u64>> {
+        if let Some(contract_integration) = &self.contract_integration {
+            let stats = contract_integration.get_stats().await;
+            let mut result = HashMap::new();
+            result.insert("active_tasks".to_string(), stats.active_tasks as u64);
+            result.insert("pending_results".to_string(), stats.pending_results as u64);
+            result.insert("total_processed".to_string(), stats.total_tasks_processed);
+            result.insert("successful_submissions".to_string(), stats.successful_submissions);
+            result.insert("failed_submissions".to_string(), stats.failed_submissions);
+            Some(result)
+        } else {
+            None
+        }
+    }
 }
 
 impl Clone for BridgeNode {
@@ -554,6 +610,7 @@ impl Clone for BridgeNode {
             settlement_stats: Arc::clone(&self.settlement_stats),
             bridge_events: self.bridge_events.clone(),
             aura_protocol_client: self.aura_protocol_client.clone(),
+            contract_integration: self.contract_integration.clone(),
             mesh_validator: self.mesh_validator.clone(),
             contract_task_queue: Arc::clone(&self.contract_task_queue),
         }

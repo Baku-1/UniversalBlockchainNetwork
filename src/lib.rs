@@ -2,6 +2,7 @@
 
 // Declare our application's modules
 pub mod config;
+pub mod contract_integration;
 pub mod crypto;
 pub mod ipc;
 pub mod p2p;
@@ -20,6 +21,7 @@ pub mod aura_protocol;
 
 // Re-export public APIs for external use
 pub use config::*;
+pub use contract_integration::{ContractIntegration, ContractTask, TaskStatus as ContractTaskStatus, TaskResult as ContractTaskResult};
 pub use crypto::*;
 pub use mesh_validation::{MeshValidator, MeshTransaction, ValidationResult};
 pub use bridge_node::{BridgeNode, BridgeEvent};

@@ -6,9 +6,12 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use std::time::Instant;
+use serde::{Deserialize, Serialize};
+use anyhow::Result;
 
 /// Enhanced engine status for the UI
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EngineStatus {
     pub is_connected: bool,
     pub is_running: bool,
@@ -40,7 +43,7 @@ pub struct EngineStatus {
     pub validation_rate: f32,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MeshPeerInfo {
     pub id: String,
     pub is_connected: bool,
@@ -48,12 +51,68 @@ pub struct MeshPeerInfo {
     pub last_seen: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Web3UserInfo {
     pub id: String,
     pub is_online: bool,
     pub address: String,
     pub last_action: String,
+}
+
+/// IPC message types for communication
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum IpcMessage {
+    /// Ping message for connectivity testing
+    Ping {
+        timestamp: u64,
+        sequence: u64,
+    },
+    /// Pong response to ping
+    Pong {
+        timestamp: u64,
+        sequence: u64,
+        latency_ms: u64,
+    },
+    /// Request for engine status
+    StatusRequest,
+    /// Engine status response
+    StatusResponse {
+        status: EngineStatus,
+    },
+    /// Command to execute
+    Command {
+        command: String,
+        params: Option<serde_json::Value>,
+    },
+    /// Command response
+    CommandResponse {
+        success: bool,
+        message: Option<String>,
+        data: Option<serde_json::Value>,
+    },
+    /// Error message
+    Error {
+        message: String,
+        code: Option<u32>,
+    },
+}
+
+/// Connection statistics for monitoring
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectionStats {
+    pub connected_clients: usize,
+    pub total_messages_sent: u64,
+    pub total_messages_received: u64,
+    pub average_latency_ms: f64,
+    pub last_ping_time: Option<String>,
+    pub uptime_seconds: u64,
+}
+
+/// IPC server state
+pub struct IpcServer {
+    pub stats: Arc<RwLock<ConnectionStats>>,
+    pub start_time: Instant,
 }
 
 impl Default for EngineStatus {
@@ -473,6 +532,210 @@ async fn handle_command(command: serde_json::Value) -> String {
             json!({"type": "error", "message": "Unknown command"}).to_string()
         }
     }
+}
+
+/// Enhanced IPC server with ping/pong functionality
+impl IpcServer {
+    /// Create a new IPC server
+    pub fn new() -> Self {
+        Self {
+            stats: Arc::new(RwLock::new(ConnectionStats {
+                connected_clients: 0,
+                total_messages_sent: 0,
+                total_messages_received: 0,
+                average_latency_ms: 0.0,
+                last_ping_time: None,
+                uptime_seconds: 0,
+            })),
+            start_time: Instant::now(),
+        }
+    }
+
+    /// Handle ping message and return pong
+    pub async fn handle_ping(&self, timestamp: u64, sequence: u64) -> IpcMessage {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let latency_ms = now.saturating_sub(timestamp);
+
+        // Update stats
+        {
+            let mut stats = self.stats.write().await;
+            stats.total_messages_received += 1;
+            stats.last_ping_time = Some(chrono::Utc::now().to_rfc3339());
+
+            // Update average latency (simple moving average)
+            if stats.total_messages_received > 1 {
+                stats.average_latency_ms = (stats.average_latency_ms + latency_ms as f64) / 2.0;
+            } else {
+                stats.average_latency_ms = latency_ms as f64;
+            }
+        }
+
+        IpcMessage::Pong {
+            timestamp: now,
+            sequence,
+            latency_ms,
+        }
+    }
+
+    /// Process IPC message and return response
+    pub async fn process_message(&self, message: IpcMessage) -> Option<IpcMessage> {
+        match message {
+            IpcMessage::Ping { timestamp, sequence } => {
+                Some(self.handle_ping(timestamp, sequence).await)
+            }
+            IpcMessage::StatusRequest => {
+                let status = ENGINE_STATUS.read().await.clone();
+                Some(IpcMessage::StatusResponse { status })
+            }
+            IpcMessage::Command { command, params } => {
+                let response = handle_command_enhanced(&command, params).await;
+                Some(response)
+            }
+            _ => None, // Other message types handled elsewhere
+        }
+    }
+
+    /// Get connection statistics
+    pub async fn get_stats(&self) -> ConnectionStats {
+        let mut stats = self.stats.read().await.clone();
+        stats.uptime_seconds = self.start_time.elapsed().as_secs();
+        stats
+    }
+
+    /// Update client connection count
+    pub async fn update_client_count(&self, delta: i32) {
+        let mut stats = self.stats.write().await;
+        if delta > 0 {
+            stats.connected_clients += delta as usize;
+        } else {
+            stats.connected_clients = stats.connected_clients.saturating_sub((-delta) as usize);
+        }
+    }
+}
+
+/// Enhanced command handler with better error handling
+async fn handle_command_enhanced(command: &str, _params: Option<serde_json::Value>) -> IpcMessage {
+    match command {
+        "ping" => {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+
+            IpcMessage::Pong {
+                timestamp,
+                sequence: 0,
+                latency_ms: 0,
+            }
+        }
+        "status" | "GetStatus" => {
+            let status = ENGINE_STATUS.read().await.clone();
+            IpcMessage::StatusResponse { status }
+        }
+        "ResumeEngine" => {
+            {
+                let mut status = ENGINE_STATUS.write().await;
+                status.is_running = true;
+            }
+            IpcMessage::CommandResponse {
+                success: true,
+                message: Some("Engine resumed".to_string()),
+                data: None,
+            }
+        }
+        "PauseEngine" => {
+            {
+                let mut status = ENGINE_STATUS.write().await;
+                status.is_running = false;
+            }
+            IpcMessage::CommandResponse {
+                success: true,
+                message: Some("Engine paused".to_string()),
+                data: None,
+            }
+        }
+        _ => {
+            IpcMessage::Error {
+                message: format!("Unknown command: {}", command),
+                code: Some(404),
+            }
+        }
+    }
+}
+
+/// Start IPC server with enhanced ping/pong functionality
+pub async fn start_enhanced_ipc_server(port: u16) -> Result<()> {
+    let addr = format!("127.0.0.1:{}", port);
+    let listener = TcpListener::bind(&addr).await?;
+    let server = Arc::new(IpcServer::new());
+
+    tracing::info!("Enhanced IPC server listening on {}", addr);
+
+    while let Ok((stream, addr)) = listener.accept().await {
+        let server_clone = Arc::clone(&server);
+        tokio::spawn(async move {
+            if let Err(e) = handle_enhanced_connection(stream, server_clone).await {
+                tracing::error!("Error handling connection from {}: {}", addr, e);
+            }
+        });
+    }
+
+    Ok(())
+}
+
+/// Handle enhanced WebSocket connection with ping/pong
+async fn handle_enhanced_connection(stream: TcpStream, server: Arc<IpcServer>) -> Result<()> {
+    let websocket = accept_async(stream).await?;
+    let (mut ws_sender, mut ws_receiver) = websocket.split();
+
+    // Update client count
+    server.update_client_count(1).await;
+
+    // Send initial status
+    let status = ENGINE_STATUS.read().await.clone();
+    let initial_message = IpcMessage::StatusResponse { status };
+    let message_text = serde_json::to_string(&initial_message)?;
+    ws_sender.send(Message::Text(message_text)).await?;
+
+    // Handle incoming messages
+    while let Some(msg_result) = ws_receiver.next().await {
+        match msg_result {
+            Ok(Message::Text(text)) => {
+                // Try to parse as IpcMessage first
+                if let Ok(ipc_message) = serde_json::from_str::<IpcMessage>(&text) {
+                    if let Some(response) = server.process_message(ipc_message).await {
+                        let response_text = serde_json::to_string(&response)?;
+                        ws_sender.send(Message::Text(response_text)).await?;
+                    }
+                } else {
+                    // Fall back to legacy command handling
+                    let response = handle_command_enhanced(&text, None).await;
+                    let response_text = serde_json::to_string(&response)?;
+                    ws_sender.send(Message::Text(response_text)).await?;
+                }
+            }
+            Ok(Message::Ping(data)) => {
+                ws_sender.send(Message::Pong(data)).await?;
+            }
+            Ok(Message::Close(_)) => {
+                tracing::info!("Client disconnected");
+                break;
+            }
+            Err(e) => {
+                tracing::error!("WebSocket error: {}", e);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // Update client count on disconnect
+    server.update_client_count(-1).await;
+    Ok(())
 }
 
 /// Update engine status (called from other modules)

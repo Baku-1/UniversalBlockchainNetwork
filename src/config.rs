@@ -1,12 +1,29 @@
 // src/config.rs
 
-use serde::Deserialize;
-use config::{Config, ConfigError, File};
+use serde::{Deserialize, Serialize};
+use config::{Config, File};
 use std::path::PathBuf;
+use anyhow::{Result, Context};
+use thiserror::Error;
+
+/// Configuration validation errors
+#[derive(Error, Debug)]
+pub enum ConfigValidationError {
+    #[error("Invalid port number: {0}")]
+    InvalidPort(u16),
+    #[error("Invalid URL format: {0}")]
+    InvalidUrl(String),
+    #[error("Invalid chain ID: {0}")]
+    InvalidChainId(u64),
+    #[error("Invalid UUID format: {0}")]
+    InvalidUuid(String),
+    #[error("Configuration validation failed: {0}")]
+    ValidationFailed(String),
+}
 
 /// Defines the structure for all engine settings.
 /// This struct must match the structure of the Settings.toml file.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AppConfig {
     pub ipc_port: u16,
     pub p2p_port: u16,
@@ -26,8 +43,48 @@ pub struct AppConfig {
     pub game: GameConfig,
 }
 
+impl AppConfig {
+    /// Validate the configuration settings
+    pub fn validate(&self) -> Result<(), ConfigValidationError> {
+        // Validate port numbers
+        if self.ipc_port == 0 {
+            return Err(ConfigValidationError::InvalidPort(self.ipc_port));
+        }
+        if self.p2p_port == 0 {
+            return Err(ConfigValidationError::InvalidPort(self.p2p_port));
+        }
+
+        // Validate contract address format if provided
+        if let Some(ref address) = self.aura_protocol_address {
+            if !address.starts_with("0x") || address.len() != 42 {
+                return Err(ConfigValidationError::ValidationFailed(
+                    format!("Invalid contract address format: {}", address)
+                ));
+            }
+        }
+
+        // Validate nested configurations
+        self.mesh.validate()?;
+        self.ronin.validate()?;
+        self.game.validate()?;
+
+        Ok(())
+    }
+
+    /// Save configuration to file
+    pub fn save_to_file(&self, path: &str) -> Result<()> {
+        let toml_string = toml::to_string_pretty(self)
+            .context("Failed to serialize configuration to TOML")?;
+
+        std::fs::write(path, toml_string)
+            .with_context(|| format!("Failed to write configuration to {}", path))?;
+
+        Ok(())
+    }
+}
+
 /// Bluetooth mesh networking configuration
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct MeshConfig {
     /// Service UUID for Aura mesh network discovery
     pub service_uuid: String,
@@ -43,8 +100,39 @@ pub struct MeshConfig {
     pub advertisement_interval_ms: u64,
 }
 
+impl MeshConfig {
+    /// Validate mesh configuration
+    pub fn validate(&self) -> Result<(), ConfigValidationError> {
+        // Validate UUID format (basic check)
+        if self.service_uuid.len() != 36 || !self.service_uuid.contains('-') {
+            return Err(ConfigValidationError::InvalidUuid(self.service_uuid.clone()));
+        }
+
+        // Validate reasonable limits
+        if self.max_peers == 0 || self.max_peers > 100 {
+            return Err(ConfigValidationError::ValidationFailed(
+                format!("max_peers must be between 1 and 100, got {}", self.max_peers)
+            ));
+        }
+
+        if self.message_ttl == 0 || self.message_ttl > 50 {
+            return Err(ConfigValidationError::ValidationFailed(
+                format!("message_ttl must be between 1 and 50, got {}", self.message_ttl)
+            ));
+        }
+
+        if self.scan_interval_ms < 100 || self.scan_interval_ms > 60000 {
+            return Err(ConfigValidationError::ValidationFailed(
+                format!("scan_interval_ms must be between 100 and 60000, got {}", self.scan_interval_ms)
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 /// Ronin blockchain configuration
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RoninConfig {
     /// Ronin RPC endpoint URL
     pub rpc_url: String,
@@ -60,8 +148,45 @@ pub struct RoninConfig {
     pub sync_retry_interval_secs: u64,
 }
 
+impl RoninConfig {
+    /// Validate Ronin configuration
+    pub fn validate(&self) -> Result<(), ConfigValidationError> {
+        // Validate URL format
+        if !self.rpc_url.starts_with("http://") && !self.rpc_url.starts_with("https://") {
+            return Err(ConfigValidationError::InvalidUrl(self.rpc_url.clone()));
+        }
+
+        // Validate chain ID (Ronin specific)
+        if self.chain_id != 2020 && self.chain_id != 2021 {
+            return Err(ConfigValidationError::InvalidChainId(self.chain_id));
+        }
+
+        // Validate gas parameters
+        if self.gas_price == 0 {
+            return Err(ConfigValidationError::ValidationFailed(
+                "gas_price must be greater than 0".to_string()
+            ));
+        }
+
+        if self.gas_limit < 21000 {
+            return Err(ConfigValidationError::ValidationFailed(
+                "gas_limit must be at least 21000".to_string()
+            ));
+        }
+
+        // Validate queue size
+        if self.max_offline_transactions == 0 || self.max_offline_transactions > 10000 {
+            return Err(ConfigValidationError::ValidationFailed(
+                format!("max_offline_transactions must be between 1 and 10000, got {}", self.max_offline_transactions)
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 /// Game-specific configuration
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct GameConfig {
     /// Maximum number of players in a mesh game session
     pub max_players: usize,
@@ -71,6 +196,41 @@ pub struct GameConfig {
     pub conflict_resolution_timeout_secs: u64,
     /// Maximum game actions per player per second (rate limiting)
     pub max_actions_per_second: u32,
+}
+
+impl GameConfig {
+    /// Validate game configuration
+    pub fn validate(&self) -> Result<(), ConfigValidationError> {
+        // Validate player limits
+        if self.max_players == 0 || self.max_players > 100 {
+            return Err(ConfigValidationError::ValidationFailed(
+                format!("max_players must be between 1 and 100, got {}", self.max_players)
+            ));
+        }
+
+        // Validate sync interval
+        if self.sync_interval_ms < 10 || self.sync_interval_ms > 10000 {
+            return Err(ConfigValidationError::ValidationFailed(
+                format!("sync_interval_ms must be between 10 and 10000, got {}", self.sync_interval_ms)
+            ));
+        }
+
+        // Validate timeout
+        if self.conflict_resolution_timeout_secs == 0 || self.conflict_resolution_timeout_secs > 300 {
+            return Err(ConfigValidationError::ValidationFailed(
+                format!("conflict_resolution_timeout_secs must be between 1 and 300, got {}", self.conflict_resolution_timeout_secs)
+            ));
+        }
+
+        // Validate rate limiting
+        if self.max_actions_per_second == 0 || self.max_actions_per_second > 1000 {
+            return Err(ConfigValidationError::ValidationFailed(
+                format!("max_actions_per_second must be between 1 and 1000, got {}", self.max_actions_per_second)
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for AppConfig {
@@ -126,26 +286,50 @@ impl Default for GameConfig {
 }
 
 /// Loads the application configuration from the "Settings.toml" file.
-pub fn load_config() -> Result<AppConfig, ConfigError> {
-    tracing::info!("Loading configuration from Settings.toml...");
+/// Enhanced with validation and better error handling.
+pub fn load_config() -> Result<AppConfig> {
+    load_config_from_file("Settings.toml")
+}
+
+/// Load configuration from a specific file
+pub fn load_config_from_file(filename: &str) -> Result<AppConfig> {
+    tracing::info!("Loading configuration from {}...", filename);
 
     // Create a new configuration builder
     let builder = Config::builder()
-        .add_source(File::with_name("Settings.toml").required(false))
+        .add_source(File::with_name(filename).required(false))
         .add_source(config::Environment::with_prefix("AURA"));
 
     // Build the configuration
-    let settings = builder.build()?;
+    let settings = builder.build()
+        .context("Failed to build configuration")?;
 
-    // Try to deserialize into our AppConfig struct, falling back to defaults
-    match settings.try_deserialize::<AppConfig>() {
+    // Try to deserialize into our AppConfig struct
+    let config = match settings.try_deserialize::<AppConfig>() {
         Ok(config) => {
-            tracing::info!("Configuration loaded successfully");
-            Ok(config)
+            tracing::info!("Configuration loaded successfully from {}", filename);
+            config
         }
         Err(e) => {
-            tracing::warn!("Failed to load configuration, using defaults: {}", e);
-            Ok(AppConfig::default())
+            tracing::warn!("Failed to load configuration from {}, using defaults: {}", filename, e);
+            AppConfig::default()
         }
-    }
+    };
+
+    // Validate the configuration
+    config.validate()
+        .context("Configuration validation failed")?;
+
+    tracing::info!("Configuration validated successfully");
+    Ok(config)
+}
+
+/// Create a default configuration file
+pub fn create_default_config_file(filename: &str) -> Result<()> {
+    let default_config = AppConfig::default();
+    default_config.save_to_file(filename)
+        .with_context(|| format!("Failed to create default configuration file: {}", filename))?;
+
+    tracing::info!("Created default configuration file: {}", filename);
+    Ok(())
 }

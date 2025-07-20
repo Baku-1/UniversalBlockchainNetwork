@@ -256,9 +256,16 @@ impl BluetoothMeshManager {
     /// Start advertising our presence
     async fn start_advertising(&self) -> BtResult<()> {
         if let Some(_adapter) = &self.adapter {
-            // TODO: Implement BLE advertising
-            // This would advertise our service UUID and node capabilities
-            tracing::info!("Started advertising mesh presence");
+            // TODO: Implement BLE advertising with service UUID
+            // For now, we'll use a simulated advertising approach
+            tracing::info!("Started advertising mesh presence with service UUID: {}", self.config.service_uuid);
+
+            // Update IPC status to show mesh mode
+            crate::ipc::update_engine_status(|status| {
+                status.mode = "Bluetooth Mesh".to_string();
+                status.mesh_mode = true;
+                status.node_id = self.node_keys.node_id();
+            }).await;
         }
         Ok(())
     }
@@ -515,6 +522,8 @@ impl BluetoothMeshManager {
         let _ = self.mesh_events.send(MeshEvent::MessageSent(message.id)).await;
         Ok(())
     }
+
+
 }
 
 // Note: BluetoothMeshManager cannot be cloned due to mpsc::Receiver

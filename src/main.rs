@@ -17,6 +17,7 @@ mod mesh_topology;
 mod mesh_routing;
 mod errors;
 mod aura_protocol;
+mod contract_integration;
 
 // Re-export public APIs for external use
 pub use config::*;

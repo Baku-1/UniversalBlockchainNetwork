@@ -6,9 +6,12 @@ use std::time::SystemTime;
 use tokio::sync::{mpsc, RwLock};
 use std::sync::Arc;
 use uuid::Uuid;
+use sha3::{Keccak256, Digest};
 use crate::crypto::NodeKeypair;
 use crate::config::RoninConfig;
+
 use crate::aura_protocol::{ValidationTask, TaskResult as ContractTaskResult, TaskStatus};
+use crate::contract_integration::{ContractIntegration, TaskResult as ContractTaskResultForSubmission};
 
 /// Mesh transaction that can be processed between mesh participants
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,7 +66,7 @@ pub struct MeshValidator {
     validation_results: Arc<RwLock<HashMap<Uuid, Vec<ValidationResult>>>>,
     user_balances: Arc<RwLock<HashMap<String, UserBalance>>>, // Track mesh balances
     validation_events: mpsc::Sender<ValidationEvent>,
-    // Contract task validation
+    // Contract task tracking
     active_contract_tasks: Arc<RwLock<HashMap<u64, ValidationTask>>>,
     contract_task_signatures: Arc<RwLock<HashMap<u64, HashMap<String, Vec<u8>>>>>, // task_id -> (node_id -> signature)
     contract_task_results: Arc<RwLock<HashMap<u64, Vec<u8>>>>, // task_id -> result_data
@@ -508,23 +511,23 @@ impl MeshValidator {
 
     /// Get contract task result ready for submission
     pub async fn get_contract_task_result(&self, task_id: u64) -> Option<ContractTaskResult> {
-        let (task, signatures, result) = {
+        let (task, task_signatures, result) = {
             let active = self.active_contract_tasks.read().await;
             let sigs = self.contract_task_signatures.read().await;
             let results = self.contract_task_results.read().await;
 
             let task = active.get(&task_id).cloned()?;
-            let signatures = sigs.get(&task_id).cloned().unwrap_or_default();
+            let task_signatures = sigs.get(&task_id).cloned().unwrap_or_default();
             let result = results.get(&task_id).cloned()?;
 
-            (task, signatures, result)
+            (task, task_signatures, result)
         };
 
         // Check if we have enough signatures
         let required_signatures = (task.worker_cohort.len() / 2) + 1;
-        if signatures.len() >= required_signatures {
-            let signature_vec: Vec<Vec<u8>> = signatures.values().cloned().collect();
-            let signers: Vec<String> = signatures.keys().cloned().collect();
+        if task_signatures.len() >= required_signatures {
+            let signature_vec: Vec<Vec<u8>> = task_signatures.values().cloned().collect();
+            let signers: Vec<String> = task_signatures.keys().cloned().collect();
 
             Some(ContractTaskResult {
                 task_id,
@@ -571,5 +574,99 @@ impl MeshValidator {
         let mut balances = self.user_balances.write().await;
         balances.insert(address, balance);
         Ok(())
+    }
+
+
+
+    /// Submit contract task result through mesh validation
+    pub async fn submit_contract_task_result(&self, contract_integration: &ContractIntegration, task_id: u64, result_data: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+        tracing::info!("Submitting contract task result for task {}", task_id);
+
+        // Get the task
+        let task = contract_integration.get_task(task_id).await
+            .ok_or_else(|| format!("Contract task {} not found", task_id))?;
+
+        // Create signature for the result
+        let signature = self.sign_contract_result(task_id, &result_data)?;
+
+        // Collect signatures from other mesh validators
+        let signatures = self.collect_mesh_signatures(task_id, &result_data).await?;
+
+        // Create contract task result
+        // Create the contract result for submission
+        let contract_result = ContractTaskResultForSubmission {
+            task_id,
+            result_data: result_data.clone(),
+            signatures: vec![], // Will be populated with actual signatures
+            submitter: self.node_keys.node_id(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        };
+
+        // Submit to contract
+        let tx_hash = contract_integration.submit_task_result(contract_result).await?;
+        tracing::info!("Contract task result submitted with tx hash: {}", tx_hash);
+
+        // Send validation event
+        let _ = self.validation_events.send(ValidationEvent::ContractTaskCompleted(task_id, true)).await;
+
+        Ok(())
+    }
+
+    /// Sign contract task result
+    fn sign_contract_result(&self, task_id: u64, result_data: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+        // Create message to sign: task_id + result_hash
+        let result_hash = Keccak256::digest(result_data);
+        let mut message = Vec::new();
+        message.extend_from_slice(&task_id.to_be_bytes());
+        message.extend_from_slice(&result_hash);
+
+        // Sign the message
+        let signature = self.node_keys.sign(&message);
+        Ok(hex::encode(signature))
+    }
+
+    /// Collect signatures from other mesh validators
+    async fn collect_mesh_signatures(&self, task_id: u64, result_data: &[u8]) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        // TODO: Implement mesh signature collection
+        // This would involve:
+        // 1. Broadcasting the result to other mesh validators
+        // 2. Collecting their signatures
+        // 3. Verifying the signatures
+        // 4. Returning the collected signatures
+
+        // For now, return just our own signature
+        let our_signature = self.sign_contract_result(task_id, result_data)?;
+        Ok(vec![our_signature])
+    }
+
+    /// Verify contract task result from another validator
+    pub async fn verify_contract_task_result(&self, task_id: u64, result_data: &[u8], signature: &str, validator_id: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        // TODO: Implement signature verification
+        // This would verify the signature against the validator's public key
+
+        tracing::debug!("Verifying contract task result from validator {}", validator_id);
+
+        // For now, return true (accept all signatures)
+        // In production, this would verify the actual cryptographic signature
+        Ok(true)
+    }
+
+    /// Get contract task statistics
+    pub async fn get_contract_task_stats(&self) -> HashMap<String, u64> {
+        let mut stats = HashMap::new();
+
+        let active_tasks = self.active_contract_tasks.read().await;
+        stats.insert("active_contract_tasks".to_string(), active_tasks.len() as u64);
+
+        let signatures = self.contract_task_signatures.read().await;
+        stats.insert("pending_signatures".to_string(), signatures.len() as u64);
+
+        let results = self.contract_task_results.read().await;
+        stats.insert("pending_results".to_string(), results.len() as u64);
+
+        stats
     }
 }
