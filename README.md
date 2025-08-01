@@ -1,4 +1,4 @@
-# Aura Validation Network - Ronin Blockchain Mesh Utility
+# Universal Blockchain Network - Ronin Blockchain Mesh Utility
 
 A revolutionary decentralized validation network that enables offline Ronin blockchain transactions through Bluetooth mesh networking. This utility allows Ronin users to transact with each other directly over mesh networks when internet connectivity is unavailable, with automatic settlement to the Ronin blockchain when connectivity returns.
 
