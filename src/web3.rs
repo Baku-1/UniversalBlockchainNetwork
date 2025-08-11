@@ -8,6 +8,7 @@ use ethers::{
     types::{Address, U256, H256, TransactionRequest},
 };
 use crate::config::RoninConfig;
+use crate::token_registry::CrossChainTokenRegistry;
 
 /// Ronin blockchain transaction structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +107,9 @@ pub struct RoninClient {
     config: RoninConfig,
     pub provider: Arc<Provider<Http>>,
     chain_id: u64,
+    
+    // Cross-chain token registry integration
+    token_registry: Arc<CrossChainTokenRegistry>,
 }
 
 impl RoninClient {
@@ -114,10 +118,14 @@ impl RoninClient {
         let provider = Provider::<Http>::try_from(&config.rpc_url)?;
         let provider = Arc::new(provider);
 
+        // Initialize cross-chain token registry
+        let token_registry = Arc::new(CrossChainTokenRegistry::new());
+
         Ok(Self {
             config: config.clone(),
             provider,
             chain_id: config.chain_id,
+            token_registry,
         })
     }
 

@@ -1,0 +1,495 @@
+// src/economic_engine.rs
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
+use tokio::sync::RwLock;
+use std::sync::Arc;
+use anyhow::Result;
+use tracing;
+
+/// Network statistics for economic calculations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkStats {
+    pub total_transactions: u64,
+    pub active_users: u64,
+    pub network_utilization: f64, // 0.0 to 1.0
+    pub average_transaction_value: u64,
+    pub mesh_congestion_level: f64, // 0.0 to 1.0
+    pub total_lending_volume: u64,
+    pub total_borrowing_volume: u64,
+    pub average_collateral_ratio: f64,
+}
+
+/// Interest rate engine for dynamic rate calculation
+#[derive(Debug, Clone)]
+pub struct InterestRateEngine {
+    pub base_rate: f64,
+    pub supply_demand_multiplier: f64,
+    pub network_utilization_factor: f64,
+    pub historical_rates: Arc<RwLock<Vec<(SystemTime, f64)>>>,
+    pub rate_adjustment_history: Arc<RwLock<Vec<RateAdjustment>>>,
+}
+
+/// Rate adjustment record for transparency
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateAdjustment {
+    pub timestamp: SystemTime,
+    pub old_rate: f64,
+    pub new_rate: f64,
+    pub reason: String,
+    pub network_stats: NetworkStats,
+}
+
+/// Lending pool for automated distribution
+#[derive(Debug, Clone)]
+pub struct LendingPool {
+    pub total_deposits: u64,
+    pub active_loans: Arc<RwLock<HashMap<String, LoanDetails>>>,
+    pub interest_distribution_queue: Arc<RwLock<Vec<InterestPayment>>>,
+    pub pool_utilization: f64,
+    pub risk_score: f64,
+}
+
+/// Loan details for tracking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoanDetails {
+    pub loan_id: String,
+    pub borrower_address: String,
+    pub lender_address: String,
+    pub amount: u64,
+    pub interest_rate: f64,
+    pub collateral_amount: u64,
+    pub collateral_ratio: f64,
+    pub created_at: SystemTime,
+    pub due_date: SystemTime,
+    pub status: LoanStatus,
+    pub risk_score: f64,
+}
+
+/// Loan status enumeration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum LoanStatus {
+    Active,
+    Repaid,
+    Defaulted,
+    Liquidated,
+    Underwater,
+}
+
+/// Interest payment structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterestPayment {
+    pub loan_id: String,
+    pub amount: u64,
+    pub due_date: SystemTime,
+    pub is_paid: bool,
+    pub payment_hash: Option<String>,
+}
+
+/// Collateral requirements for loans
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollateralRequirements {
+    pub minimum_ratio: f64,
+    pub liquidation_threshold: f64,
+    pub maintenance_margin: f64,
+    pub risk_adjustment: f64,
+}
+
+impl InterestRateEngine {
+    /// Create a new interest rate engine
+    pub fn new() -> Self {
+        Self {
+            base_rate: 0.05, // 5% base rate
+            supply_demand_multiplier: 1.0,
+            network_utilization_factor: 1.0,
+            historical_rates: Arc::new(RwLock::new(Vec::new())),
+            rate_adjustment_history: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    /// Calculate dynamic lending rate based on network activity
+    pub async fn calculate_lending_rate(&self, network_stats: &NetworkStats) -> f64 {
+        let utilization_bonus = network_stats.network_utilization * 0.02; // Up to 2% bonus
+        let congestion_penalty = network_stats.mesh_congestion_level * 0.01; // Up to 1% penalty
+        let volume_bonus = if network_stats.total_lending_volume > 1_000_000 {
+            0.005 // 0.5% bonus for high volume
+        } else {
+            0.0
+        };
+        
+        let calculated_rate = self.base_rate + utilization_bonus - congestion_penalty + volume_bonus;
+        
+        // Record rate change
+        self.record_rate_change(calculated_rate, network_stats).await;
+        
+        calculated_rate.max(0.01) // Minimum 1% rate
+    }
+
+    /// Calculate borrowing rate based on collateral ratio
+    pub async fn calculate_borrowing_rate(&self, collateral_ratio: f64, network_stats: &NetworkStats) -> f64 {
+        let base_borrowing_rate = self.calculate_lending_rate(network_stats).await + 0.02; // 2% premium over lending
+        
+        // Lower rates for higher collateral
+        let collateral_discount = if collateral_ratio >= 2.0 {
+            0.01 // 1% discount for 200%+ collateral
+        } else if collateral_ratio >= 1.5 {
+            0.005 // 0.5% discount for 150%+ collateral
+        } else {
+            0.0
+        };
+        
+        // Risk premium for low collateral
+        let risk_premium = if collateral_ratio < 1.2 {
+            0.03 // 3% risk premium for low collateral
+        } else if collateral_ratio < 1.5 {
+            0.015 // 1.5% risk premium for moderate collateral
+        } else {
+            0.0
+        };
+        
+        let final_rate = base_borrowing_rate - collateral_discount + risk_premium;
+        final_rate.max(0.02) // Minimum 2% rate
+    }
+
+    /// Adjust rates for mesh congestion
+    pub async fn adjust_rates_for_mesh_congestion(&self, congestion_level: f64) -> f64 {
+        let adjustment = congestion_level * 0.005; // 0.5% adjustment per congestion level
+        let new_rate = self.base_rate + adjustment;
+        
+        // Record adjustment
+        let adjustment_record = RateAdjustment {
+            timestamp: SystemTime::now(),
+            old_rate: self.base_rate,
+            new_rate,
+            reason: format!("Mesh congestion adjustment: {:.2}%", congestion_level * 100.0),
+            network_stats: NetworkStats {
+                total_transactions: 0,
+                active_users: 0,
+                network_utilization: 0.0,
+                average_transaction_value: 0,
+                mesh_congestion_level: congestion_level,
+                total_lending_volume: 0,
+                total_borrowing_volume: 0,
+                average_collateral_ratio: 0.0,
+            },
+        };
+        
+        {
+            let mut history = self.rate_adjustment_history.write().await;
+            history.push(adjustment_record);
+        }
+        
+        new_rate
+    }
+
+    /// Record rate change for transparency
+    async fn record_rate_change(&self, new_rate: f64, network_stats: &NetworkStats) {
+        let mut history = self.historical_rates.write().await;
+        history.push((SystemTime::now(), new_rate));
+        
+        // Keep only last 1000 rate changes
+        if history.len() > 1000 {
+            history.remove(0);
+        }
+        
+        tracing::info!("Interest rate adjusted to {:.3}% based on network stats", new_rate * 100.0);
+    }
+
+    /// Get rate history for analysis
+    pub async fn get_rate_history(&self) -> Vec<(SystemTime, f64)> {
+        self.historical_rates.read().await.clone()
+    }
+
+    /// Get rate adjustment history
+    pub async fn get_adjustment_history(&self) -> Vec<RateAdjustment> {
+        self.rate_adjustment_history.read().await.clone()
+    }
+}
+
+impl LendingPool {
+    /// Create a new lending pool
+    pub fn new() -> Self {
+        Self {
+            total_deposits: 0,
+            active_loans: Arc::new(RwLock::new(HashMap::new())),
+            interest_distribution_queue: Arc::new(RwLock::new(Vec::new())),
+            pool_utilization: 0.0,
+            risk_score: 0.0,
+        }
+    }
+
+    /// Create a new loan
+    pub async fn create_loan(
+        &mut self,
+        borrower: String,
+        lender: String,
+        amount: u64,
+        collateral: u64,
+        duration_days: u32,
+        interest_rate: f64,
+    ) -> Result<String> {
+        let loan_id = format!("loan_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
+        let collateral_ratio = collateral as f64 / amount as f64;
+        
+        let loan = LoanDetails {
+            loan_id: loan_id.clone(),
+            borrower_address: borrower,
+            lender_address: lender,
+            amount,
+            interest_rate,
+            collateral_amount: collateral,
+            collateral_ratio,
+            created_at: SystemTime::now(),
+            due_date: SystemTime::now() + Duration::from_secs(duration_days as u64 * 86400),
+            status: LoanStatus::Active,
+            risk_score: self.calculate_loan_risk(collateral_ratio, amount),
+        };
+
+        // Add to active loans
+        {
+            let mut loans = self.active_loans.write().await;
+            loans.insert(loan_id.clone(), loan);
+        }
+
+        // Update pool utilization
+        self.update_pool_utilization().await;
+
+        tracing::info!("Created loan {}: {} RON with {:.2}x collateral", loan_id, amount, collateral_ratio);
+        Ok(loan_id)
+    }
+
+    /// Calculate loan risk score
+    fn calculate_loan_risk(&self, collateral_ratio: f64, amount: u64) -> f64 {
+        let base_risk = 1.0 - (collateral_ratio - 1.0).max(0.0) * 0.5;
+        let amount_risk = (amount as f64 / 1_000_000.0).min(1.0) * 0.3; // Higher amounts = higher risk
+        
+        (base_risk + amount_risk).max(0.1).min(1.0)
+    }
+
+    /// Update pool utilization metrics
+    async fn update_pool_utilization(&mut self) {
+        let loans = self.active_loans.read().await;
+        let total_loaned = loans.values().map(|loan| loan.amount).sum::<u64>();
+        
+        self.pool_utilization = if self.total_deposits > 0 {
+            total_loaned as f64 / self.total_deposits as f64
+        } else {
+            0.0
+        };
+
+        // Calculate overall risk score
+        let total_risk: f64 = loans.values().map(|loan| loan.risk_score).sum();
+        self.risk_score = if loans.len() > 0 {
+            total_risk / loans.len() as f64
+        } else {
+            0.0
+        };
+    }
+
+    /// Add deposit to lending pool
+    pub async fn add_deposit(&mut self, amount: u64) -> Result<()> {
+        self.total_deposits += amount;
+        self.update_pool_utilization().await;
+        
+        tracing::info!("Added {} RON deposit to lending pool. Total: {} RON", amount, self.total_deposits);
+        Ok(())
+    }
+
+    /// Get pool statistics
+    pub async fn get_pool_stats(&self) -> PoolStats {
+        let loans = self.active_loans.read().await;
+        let total_loaned = loans.values().map(|loan| loan.amount).sum::<u64>();
+        let active_loan_count = loans.len();
+        
+        PoolStats {
+            total_deposits: self.total_deposits,
+            total_loaned,
+            active_loans: active_loan_count,
+            pool_utilization: self.pool_utilization,
+            risk_score: self.risk_score,
+            available_for_lending: self.total_deposits.saturating_sub(total_loaned),
+        }
+    }
+
+    /// Process loan repayment
+    pub async fn process_repayment(&mut self, loan_id: &str, repayment_amount: u64) -> Result<bool> {
+        let mut loans = self.active_loans.write().await;
+        
+        if let Some(loan) = loans.get_mut(loan_id) {
+            if loan.status == LoanStatus::Active {
+                loan.status = LoanStatus::Repaid;
+                
+                // Calculate interest payment
+                let interest_amount = (loan.amount as f64 * loan.interest_rate) as u64;
+                let total_repayment = loan.amount + interest_amount;
+                
+                if repayment_amount >= total_repayment {
+                    // Add interest payment to distribution queue
+                    let interest_payment = InterestPayment {
+                        loan_id: loan_id.to_string(),
+                        amount: interest_amount,
+                        due_date: SystemTime::now(),
+                        is_paid: false,
+                        payment_hash: None,
+                    };
+                    
+                    {
+                        let mut queue = self.interest_distribution_queue.write().await;
+                        queue.push(interest_payment);
+                    }
+                    
+                    // Drop the loans lock before calling update_pool_utilization
+                    drop(loans);
+                    self.update_pool_utilization().await;
+                    
+                    tracing::info!("Loan {} repaid successfully with {} RON interest", loan_id, interest_amount);
+                    return Ok(true);
+                }
+            }
+        }
+        
+        Ok(false)
+    }
+}
+
+/// Pool statistics for monitoring
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolStats {
+    pub total_deposits: u64,
+    pub total_loaned: u64,
+    pub active_loans: usize,
+    pub pool_utilization: f64,
+    pub risk_score: f64,
+    pub available_for_lending: u64,
+}
+
+/// Economic engine for managing the entire banking system
+pub struct EconomicEngine {
+    pub interest_rate_engine: Arc<InterestRateEngine>,
+    pub lending_pools: Arc<RwLock<HashMap<String, LendingPool>>>,
+    pub network_stats: Arc<RwLock<NetworkStats>>,
+    pub collateral_requirements: CollateralRequirements,
+}
+
+impl EconomicEngine {
+    /// Create a new economic engine
+    pub fn new() -> Self {
+        Self {
+            interest_rate_engine: Arc::new(InterestRateEngine::new()),
+            lending_pools: Arc::new(RwLock::new(HashMap::new())),
+            network_stats: Arc::new(RwLock::new(NetworkStats {
+                total_transactions: 0,
+                active_users: 0,
+                network_utilization: 0.0,
+                average_transaction_value: 0,
+                mesh_congestion_level: 0.0,
+                total_lending_volume: 0,
+                total_borrowing_volume: 0,
+                average_collateral_ratio: 0.0,
+            })),
+            collateral_requirements: CollateralRequirements {
+                minimum_ratio: 1.2,
+                liquidation_threshold: 1.1,
+                maintenance_margin: 1.15,
+                risk_adjustment: 0.1,
+            },
+        }
+    }
+
+    /// Update network statistics
+    pub async fn update_network_stats(&self, stats: NetworkStats) -> Result<()> {
+        let mut current_stats = self.network_stats.write().await;
+        *current_stats = stats.clone();
+        
+        // Adjust interest rates based on new stats
+        let new_lending_rate = self.interest_rate_engine.calculate_lending_rate(&stats).await;
+        tracing::info!("Updated network stats, new lending rate: {:.3}%", new_lending_rate * 100.0);
+        
+        Ok(())
+    }
+
+    /// Create a new lending pool
+    pub async fn create_lending_pool(&self, pool_name: String) -> Result<()> {
+        let mut pools = self.lending_pools.write().await;
+        pools.insert(pool_name.clone(), LendingPool::new());
+        
+        tracing::info!("Created new lending pool: {}", pool_name);
+        Ok(())
+    }
+
+    /// Get economic engine statistics
+    pub async fn get_economic_stats(&self) -> EconomicStats {
+        let network_stats = self.network_stats.read().await;
+        let pools = self.lending_pools.read().await;
+        
+        // Calculate total active loans by iterating through pools
+        let mut total_active_loans = 0;
+        for pool in pools.values() {
+            let pool_loans = pool.active_loans.read().await;
+            total_active_loans += pool_loans.len();
+        }
+        
+        let total_pool_deposits: u64 = pools.values().map(|pool| pool.total_deposits).sum();
+        
+        EconomicStats {
+            network_stats: network_stats.clone(),
+            total_pool_deposits,
+            total_active_loans,
+            current_lending_rate: self.interest_rate_engine.calculate_lending_rate(&network_stats).await,
+            pool_count: pools.len(),
+        }
+    }
+}
+
+/// Economic engine statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EconomicStats {
+    pub network_stats: NetworkStats,
+    pub total_pool_deposits: u64,
+    pub total_active_loans: usize,
+    pub current_lending_rate: f64,
+    pub pool_count: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_interest_rate_calculation() {
+        let engine = InterestRateEngine::new();
+        let stats = NetworkStats {
+            total_transactions: 1000,
+            active_users: 100,
+            network_utilization: 0.8,
+            average_transaction_value: 1000,
+            mesh_congestion_level: 0.2,
+            total_lending_volume: 500_000,
+            total_borrowing_volume: 300_000,
+            average_collateral_ratio: 1.5,
+        };
+
+        let lending_rate = engine.calculate_lending_rate(&stats).await;
+        assert!(lending_rate > 0.05); // Should be higher than base rate
+        assert!(lending_rate < 0.10); // Should be reasonable
+    }
+
+    #[tokio::test]
+    async fn test_lending_pool_creation() {
+        let mut pool = LendingPool::new();
+        let loan_id = pool.create_loan(
+            "borrower1".to_string(),
+            "lender1".to_string(),
+            1000,
+            1500,
+            30,
+            0.06,
+        ).await.unwrap();
+
+        assert!(!loan_id.is_empty());
+        
+        let stats = pool.get_pool_stats().await;
+        assert_eq!(stats.active_loans, 1);
+    }
+}

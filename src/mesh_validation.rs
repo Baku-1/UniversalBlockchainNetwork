@@ -12,6 +12,7 @@ use crate::config::RoninConfig;
 
 use crate::aura_protocol::{ValidationTask, TaskResult as ContractTaskResult, TaskStatus};
 use crate::contract_integration::{ContractIntegration, TaskResult as ContractTaskResultForSubmission};
+use crate::economic_engine::{EconomicEngine, NetworkStats};
 
 /// Mesh transaction that can be processed between mesh participants
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +71,9 @@ pub struct MeshValidator {
     active_contract_tasks: Arc<RwLock<HashMap<u64, ValidationTask>>>,
     contract_task_signatures: Arc<RwLock<HashMap<u64, HashMap<String, Vec<u8>>>>>, // task_id -> (node_id -> signature)
     contract_task_results: Arc<RwLock<HashMap<u64, Vec<u8>>>>, // task_id -> result_data
+    
+    // Economic engine integration
+    economic_engine: Arc<EconomicEngine>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +120,7 @@ impl MeshValidator {
             active_contract_tasks: Arc::new(RwLock::new(HashMap::new())),
             contract_task_signatures: Arc::new(RwLock::new(HashMap::new())),
             contract_task_results: Arc::new(RwLock::new(HashMap::new())),
+            economic_engine: Arc::new(EconomicEngine::new()),
         }
     }
 
@@ -315,6 +320,9 @@ impl MeshValidator {
 
         let _ = self.validation_events.send(ValidationEvent::BalanceUpdated(transaction.from_address.clone())).await;
         let _ = self.validation_events.send(ValidationEvent::BalanceUpdated(transaction.to_address.clone())).await;
+
+        // Update economic engine with network statistics
+        self.update_economic_stats(transaction).await?;
 
         Ok(())
     }
@@ -668,5 +676,48 @@ impl MeshValidator {
         stats.insert("pending_results".to_string(), results.len() as u64);
 
         stats
+    }
+
+    /// Update economic engine with network statistics
+    async fn update_economic_stats(&self, transaction: &MeshTransaction) -> Result<(), Box<dyn std::error::Error>> {
+        // Get current network statistics
+        let balances = self.user_balances.read().await;
+        let pending = self.pending_transactions.read().await;
+        
+        let total_transactions = pending.len() as u64;
+        let active_users = balances.len() as u64;
+        
+        // Calculate network utilization based on active transactions
+        let network_utilization = (total_transactions as f64 / 1000.0).min(1.0); // Cap at 100%
+        
+        // Calculate average transaction value
+        let total_value: u64 = pending.values()
+            .map(|tx| tx.amount)
+            .sum();
+        let average_transaction_value = if total_transactions > 0 {
+            total_value / total_transactions
+        } else {
+            0
+        };
+        
+        // Estimate mesh congestion based on pending transactions
+        let mesh_congestion_level = (total_transactions as f64 / 500.0).min(1.0); // Cap at 100%
+        
+        // Create network stats for economic engine
+        let network_stats = NetworkStats {
+            total_transactions,
+            active_users,
+            network_utilization,
+            average_transaction_value,
+            mesh_congestion_level,
+            total_lending_volume: 0, // Would be calculated from lending pools
+            total_borrowing_volume: 0, // Would be calculated from lending pools
+            average_collateral_ratio: 1.5, // Default value
+        };
+        
+        // Update economic engine
+        self.economic_engine.update_network_stats(network_stats).await?;
+        
+        Ok(())
     }
 }

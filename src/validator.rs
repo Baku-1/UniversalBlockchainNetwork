@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 // Define the data structures for blocks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct BlockToValidate {
     pub id: String,
     pub data: Vec<u8>
@@ -27,7 +27,7 @@ pub struct ComputationTask {
     pub created_at: std::time::SystemTime,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum TaskType {
     /// Validate a blockchain block
     BlockValidation(BlockToValidate),
@@ -70,7 +70,7 @@ pub enum TaskResultType {
 }
 
 // Placeholder structures for game and transaction data
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct GameStateData {
     pub player_id: String,
     pub action: String,
@@ -78,7 +78,7 @@ pub struct GameStateData {
     pub state_hash: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TransactionData {
     pub from: String,
     pub to: String,
@@ -88,7 +88,7 @@ pub struct TransactionData {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ConflictData {
     pub conflicting_actions: Vec<GameStateData>,
     pub resolution_strategy: String,

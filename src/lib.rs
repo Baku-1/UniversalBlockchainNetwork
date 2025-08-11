@@ -2,22 +2,33 @@
 
 // Declare our application's modules
 pub mod config;
-pub mod contract_integration;
 pub mod crypto;
 pub mod ipc;
 pub mod p2p;
 pub mod validator;
+pub mod errors;
+
+// NEW MODULES FOR FINAL 5% IMPLEMENTATION
+pub mod economic_engine;
+pub mod token_registry;
+pub mod gpu_processor;
+pub mod task_distributor;
+pub mod secure_execution;
+pub mod white_noise_crypto;
+pub mod polymorphic_matrix;
+
+// Modules that depend on the above modules
 pub mod web3;
-pub mod transaction_queue;
-pub mod sync;
-pub mod mesh_validation;
+pub mod contract_integration;
 pub mod bridge_node;
 pub mod store_forward;
 pub mod mesh;
 pub mod mesh_topology;
 pub mod mesh_routing;
-pub mod errors;
 pub mod aura_protocol;
+pub mod transaction_queue;
+pub mod sync;
+pub mod mesh_validation;
 
 // Re-export public APIs for external use
 pub use config::*;
@@ -31,3 +42,12 @@ pub use web3::{RoninClient, RoninTransaction, TransactionStatus};
 pub use mesh_topology::*;
 pub use errors::{NexusError, ErrorContext};
 pub use aura_protocol::{AuraProtocolClient, ValidationTask, TaskStatus, TaskResult};
+
+// NEW EXPORTS FOR FINAL 5% IMPLEMENTATION
+pub use economic_engine::{EconomicEngine, InterestRateEngine, LendingPool, NetworkStats, EconomicStats};
+pub use token_registry::{CrossChainTokenRegistry, BlockchainNetwork, TokenMapping, CrossChainTransfer};
+pub use gpu_processor::{GPUProcessor, GPUTaskScheduler, GPUCapability, GPUProcessingTask};
+pub use task_distributor::{TaskDistributor, DeviceCapability, TaskComplexity, LoadBalancingStrategy};
+pub use secure_execution::{SecureExecutionEngine, SecurityStatus, SecurityLevel, SecurityAuditResult};
+pub use white_noise_crypto::{WhiteNoiseEncryption, WhiteNoiseConfig, EncryptionAlgorithm, NoisePattern};
+pub use polymorphic_matrix::{PolymorphicMatrix, PacketRecipe, PolymorphicPacket, PacketType, LayerType};
