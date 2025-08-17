@@ -1,629 +1,434 @@
 // src/gpu_processor.rs
 
-use wgpu;
-use anyhow::Result;
-use std::time::{Duration, Instant};
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use std::collections::HashMap;
-use std::iter;
+use tokio::sync::{mpsc, RwLock};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use anyhow::Result;
 use tracing;
-use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use crate::validator::TaskPriority;
-use tokio::sync::oneshot;
-use bytemuck;
+use serde::{Deserialize, Serialize};
 
-/// GPU capability information
+/// GPU processing capabilities for distributed computing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GPUCapability {
     pub compute_units: u32,
     pub memory_gb: f32,
-    pub benchmark_score: f64,
-    pub supports_compute_shaders: bool,
+    pub compute_capability: f32,
     pub max_workgroup_size: u32,
-    pub vendor: String,
-    pub device_name: String,
-}
-
-/// GPU processing task
-#[derive(Debug, Clone)]
-pub struct GPUProcessingTask {
-    pub task_id: String,
-    pub data: Vec<f32>,
-    pub compute_shader: String,
-    pub workgroup_size: u32,
-    pub expected_result_size: usize,
-    pub priority: TaskPriority,
-}
-
-
-
-/// GPU processing result
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GPUProcessingResult {
-    pub task_id: String,
-    pub result: Vec<f32>,
-    pub processing_time_ms: u64,
-    pub gpu_utilization: f64,
-    pub memory_used_mb: f64,
-    pub success: bool,
-    pub error_message: Option<String>,
+    pub supported_extensions: Vec<String>,
     pub benchmark_score: f64,
 }
 
-/// GPU processor for parallel computation
-pub struct GPUProcessor {
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
-    pub compute_pipeline: wgpu::ComputePipeline,
-    pub bind_group_layout: wgpu::BindGroupLayout,
-    pub capabilities: GPUCapability,
-    pub is_initialized: bool,
-}
-
-impl GPUProcessor {
-    /// Create a new GPU processor
-    pub async fn new() -> Result<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: None,
-            })
-            .await
-            .ok_or_else(|| anyhow::anyhow!("No GPU adapter found"))?;
-
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default(), None)
-            .await?;
-
-        // Create bind group layout for compute shaders
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Compute Bind Group Layout"),
-            entries: &[
-                // Input buffer
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Output buffer
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        // Create compute pipeline
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Compute Pipeline"),
-            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Compute Pipeline Layout"),
-                bind_group_layouts: &[&bind_group_layout],
-                push_constant_ranges: &[],
-            })),
-            module: &device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Compute Shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/compute.wgsl").into()),
-            }),
-            entry_point: "main",
-        });
-
-        // Get GPU capabilities
-        let capabilities = Self::detect_gpu_capabilities(&adapter, &device, &queue).await?;
-
-        tracing::info!("GPU processor initialized: {} ({})", capabilities.device_name, capabilities.vendor);
-
-        Ok(Self {
-            device,
-            queue,
-            compute_pipeline,
-            bind_group_layout,
-            capabilities,
-            is_initialized: true,
-        })
-    }
-
-    /// Detect GPU capabilities
-    async fn detect_gpu_capabilities(
-        adapter: &wgpu::Adapter,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) -> Result<GPUCapability> {
-        let info = adapter.get_info();
-        
-        // Estimate memory (this is approximate)
-        let memory_gb = match info.device_type {
-            wgpu::DeviceType::DiscreteGpu => 8.0, // High-end GPUs
-            wgpu::DeviceType::IntegratedGpu => 2.0, // Integrated GPUs
-            wgpu::DeviceType::Cpu => 1.0, // CPU fallback
-            _ => 4.0, // Default
-        };
-
-        // Run benchmark to get performance score
-        let benchmark_score = Self::run_gpu_benchmark(device, queue).await?;
-
-        Ok(GPUCapability {
-            compute_units: 1, // Would need to query actual GPU
-            memory_gb,
-            benchmark_score,
-            supports_compute_shaders: true,
-            max_workgroup_size: 256, // Default, would query actual GPU
-            vendor: info.vendor.to_string(),
-            device_name: info.name,
-        })
-    }
-
-    /// Run GPU benchmark to measure performance
-    async fn run_gpu_benchmark(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<f64> {
-        let start = Instant::now();
-        
-        // Create test data
-        let test_data: Vec<f32> = (0..1000).map(|i| i as f32).collect();
-        let buffer_size = (test_data.len() * std::mem::size_of::<f32>()) as u64;
-        
-        // Create input buffer
-        let input_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Benchmark Input Buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Create output buffer
-        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Benchmark Output Buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        // Write test data
-        queue.write_buffer(&input_buffer, 0, bytemuck::cast_slice(&test_data));
-
-        // Create bind group layout
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Benchmark Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        // Create compute pipeline
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Benchmark Pipeline"),
-            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Benchmark Pipeline Layout"),
-                bind_group_layouts: &[&bind_group_layout],
-                push_constant_ranges: &[],
-            })),
-            module: &device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Benchmark Shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/benchmark.wgsl").into()),
-            }),
-            entry_point: "main",
-        });
-
-        // Create bind group
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Benchmark Bind Group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: output_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        // Create command encoder and compute pass
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Benchmark Encoder"),
-        });
-
-        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("Benchmark Pass"),
-        });
-
-        compute_pass.set_pipeline(&compute_pipeline);
-        compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(test_data.len() as u32, 1, 1);
-
-        drop(compute_pass);
-        
-        // Submit and wait
-        queue.submit(iter::once(encoder.finish()));
-        device.poll(wgpu::Maintain::Wait);
-
-        let duration = start.elapsed();
-        let benchmark_score = 1000000.0 / duration.as_millis() as f64;
-
-        Ok(benchmark_score)
-    }
-
-    /// Process parallel computation task
-    pub async fn process_parallel_computation(
-        &self,
-        task: &GPUProcessingTask,
-    ) -> Result<GPUProcessingResult> {
-        let start_time = Instant::now();
-        
-        if !self.is_initialized {
-            return Err(anyhow::anyhow!("GPU processor not initialized"));
-        }
-
-        let buffer_size = (task.data.len() * std::mem::size_of::<f32>()) as u64;
-        
-        // Create input buffer
-        let input_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Input Buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Create output buffer
-        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Output Buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        // Write input data
-        self.queue.write_buffer(&input_buffer, 0, bytemuck::cast_slice(&task.data));
-
-        // Create bind group
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute Bind Group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: output_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        // Create command encoder and compute pass
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Compute Encoder"),
-        });
-
-        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("Compute Pass"),
-        });
-
-        compute_pass.set_pipeline(&self.compute_pipeline);
-        compute_pass.set_bind_group(0, &bind_group, &[]);
-        
-        // Calculate dispatch size
-        let workgroup_count = (task.data.len() as u32 + task.workgroup_size - 1) / task.workgroup_size;
-        compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
-
-        drop(compute_pass);
-        
-        // Submit work
-        self.queue.submit(iter::once(encoder.finish()));
-
-        // Read back results
-        let buffer_slice = output_buffer.slice(..);
-        let (tx, rx) = oneshot::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx.send(result).unwrap();
-        });
-        
-        self.device.poll(wgpu::Maintain::Wait);
-        rx.await??;
-
-        let data = buffer_slice.get_mapped_range();
-        let result: Vec<f32> = data.chunks_exact(4)
-            .map(|chunk| f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
-        drop(data);
-        output_buffer.unmap();
-
-        let processing_time = start_time.elapsed();
-        let gpu_utilization = self.estimate_gpu_utilization(&task, processing_time).await;
-
-        Ok(GPUProcessingResult {
-            task_id: task.task_id.clone(),
-            result,
-            processing_time_ms: processing_time.as_millis() as u64,
-            gpu_utilization,
-            memory_used_mb: buffer_size as f64 / (1024.0 * 1024.0),
-            success: true,
-            error_message: None,
-            benchmark_score: gpu_utilization * 1000.0, // Simple benchmark score based on utilization
-        })
-    }
-
-    /// Estimate GPU utilization based on task complexity and processing time
-    async fn estimate_gpu_utilization(&self, task: &GPUProcessingTask, processing_time: Duration) -> f64 {
-        // Base utilization calculation
-        let base_utilization = match task.priority {
-            TaskPriority::Critical => 0.95,
-            TaskPriority::High => 0.85,
-            TaskPriority::Normal => 0.70,
-            TaskPriority::Low => 0.50,
-        };
-
-        // Adjust based on data size
-        let size_factor = (task.data.len() as f64 / 1000000.0).min(1.0);
-        
-        // Adjust based on processing time vs expected
-        let time_factor = if processing_time.as_millis() > 1000 {
-            0.9 // Long processing time suggests high utilization
-        } else {
-            0.7 // Short processing time suggests lower utilization
-        };
-
-        (base_utilization * size_factor * time_factor).min(1.0)
-    }
-
-    /// Benchmark device capability
-    pub async fn benchmark_device_capability(&self) -> GPUCapability {
-        if !self.is_initialized {
-            return GPUCapability {
-                compute_units: 0,
-                memory_gb: 0.0,
-                benchmark_score: 0.0,
-                supports_compute_shaders: false,
-                max_workgroup_size: 0,
-                vendor: "Unknown".to_string(),
-                device_name: "Unknown".to_string(),
-            };
-        }
-
-        // Run comprehensive benchmark
-        let benchmark_score = self.run_comprehensive_benchmark().await.unwrap_or(0.0);
-        
-        let mut capabilities = self.capabilities.clone();
-        capabilities.benchmark_score = benchmark_score;
-        
-        capabilities
-    }
-
-    /// Run comprehensive benchmark
-    async fn run_comprehensive_benchmark(&self) -> Result<f64> {
-        let mut total_score = 0.0;
-        let mut test_count = 0;
-
-        // Test different data sizes
-        for size in [1000, 10000, 100000, 1000000] {
-            let test_data: Vec<f32> = (0..size).map(|i| i as f32).collect();
-            
-            let task = GPUProcessingTask {
-                task_id: format!("benchmark_{}", size),
-                data: test_data,
-                compute_shader: "".to_string(), // Use default shader
-                workgroup_size: 256,
-                expected_result_size: size,
-                priority: TaskPriority::Normal,
-            };
-
-            match self.process_parallel_computation(&task).await {
-                Ok(result) => {
-                    total_score += result.benchmark_score;
-                    test_count += 1;
-                }
-                Err(_) => {
-                    // Skip failed tests
-                }
-            }
-        }
-
-        if test_count > 0 {
-            Ok(total_score / test_count as f64)
-        } else {
-            Ok(0.0)
-        }
-    }
-
-    /// Get GPU memory usage
-    pub async fn get_memory_usage(&self) -> MemoryUsage {
-        // This is a simplified implementation
-        // In a real implementation, you would query the GPU driver for actual memory usage
-        MemoryUsage {
-            total_memory_mb: (self.capabilities.memory_gb as f64) * 1024.0,
-            used_memory_mb: 0.0, // Would query actual usage
-            free_memory_mb: (self.capabilities.memory_gb as f64) * 1024.0,
-            utilization_percentage: 0.0,
-        }
-    }
-
-    /// Check if GPU is healthy
-    pub async fn health_check(&self) -> GPUHealthStatus {
-        if !self.is_initialized {
-            return GPUHealthStatus::NotInitialized;
-        }
-
-        // Simple health check
-        let test_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
-        let task = GPUProcessingTask {
-            task_id: "health_check".to_string(),
-            data: test_data,
-            compute_shader: "".to_string(),
-            workgroup_size: 4,
-            expected_result_size: 4,
-            priority: TaskPriority::Low,
-        };
-
-        match self.process_parallel_computation(&task).await {
-            Ok(_) => GPUHealthStatus::Healthy,
-            Err(_) => GPUHealthStatus::Unhealthy,
-        }
-    }
-
-    /// Get GPU statistics
-    pub async fn get_gpu_stats(&self) -> GPUStats {
-        let memory_usage = self.get_memory_usage().await;
-        let health_status = self.health_check().await;
-
-        GPUStats {
-            capabilities: self.capabilities.clone(),
-            memory_usage,
-            health_status,
-            is_initialized: self.is_initialized,
-            total_processing_time_ms: 0, // Would track over time
-            tasks_processed: 0, // Would track over time
-        }
-    }
-}
-
-/// GPU memory usage information
+/// GPU processing task for distributed computation
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryUsage {
-    pub total_memory_mb: f64,
-    pub used_memory_mb: f64,
-    pub free_memory_mb: f64,
-    pub utilization_percentage: f64,
+pub struct GPUProcessingTask {
+    pub id: Uuid,
+    pub priority: TaskPriority,
+    pub compute_shader: String,
+    pub input_data: Vec<f32>,
+    pub expected_output_size: usize,
+    pub deadline: SystemTime,
+    pub complexity: TaskComplexity,
+    pub assigned_node: Option<String>,
+    pub status: TaskStatus,
 }
 
-/// GPU health status
+/// Task complexity levels for GPU processing
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum GPUHealthStatus {
-    Healthy,
-    Unhealthy,
-    NotInitialized,
-    Error(String),
+pub enum TaskComplexity {
+    Simple,      // Basic vector operations
+    Moderate,    // Matrix operations, simple algorithms
+    Complex,     // Advanced algorithms, multiple passes
+    Extreme,     // Machine learning, complex simulations
 }
 
-/// GPU statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GPUStats {
-    pub capabilities: GPUCapability,
-    pub memory_usage: MemoryUsage,
-    pub health_status: GPUHealthStatus,
-    pub is_initialized: bool,
-    pub total_processing_time_ms: u64,
-    pub tasks_processed: u64,
+/// Task status for GPU processing
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum TaskStatus {
+    Pending,
+    Assigned,
+    Processing,
+    Completed,
+    Failed(String),
 }
 
-/// GPU task scheduler for managing multiple tasks
+/// GPU task scheduler for distributed processing
 pub struct GPUTaskScheduler {
-    pub gpu_processor: Arc<GPUProcessor>,
-    pub task_queue: Arc<RwLock<Vec<GPUProcessingTask>>>,
-    pub completed_tasks: Arc<RwLock<HashMap<String, GPUProcessingResult>>>,
-    pub max_concurrent_tasks: usize,
+    available_gpus: Arc<RwLock<HashMap<String, GPUCapability>>>,
+    task_queue: Arc<RwLock<Vec<GPUProcessingTask>>>,
+    active_tasks: Arc<RwLock<HashMap<Uuid, GPUProcessingTask>>>,
+    completed_tasks: Arc<RwLock<HashMap<Uuid, TaskResult>>>,
+    scheduler_events: mpsc::Sender<SchedulerEvent>,
+}
+
+/// Task result from GPU processing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskResult {
+    pub task_id: Uuid,
+    pub result_data: Vec<f32>,
+    pub processing_time: Duration,
+    pub node_id: String,
+    pub confidence_score: f64,
+    pub metadata: HashMap<String, String>,
+}
+
+/// Scheduler events for monitoring
+#[derive(Debug, Clone)]
+pub enum SchedulerEvent {
+    TaskAssigned(Uuid, String),
+    TaskCompleted(Uuid, TaskResult),
+    TaskFailed(Uuid, String),
+    GPURegistered(String, GPUCapability),
+    GPURemoved(String),
 }
 
 impl GPUTaskScheduler {
     /// Create a new GPU task scheduler
-    pub fn new(gpu_processor: Arc<GPUProcessor>) -> Self {
-        Self {
-            gpu_processor,
-            task_queue: Arc::new(RwLock::new(Vec::new())),
-            completed_tasks: Arc::new(RwLock::new(HashMap::new())),
-            max_concurrent_tasks: 4, // Process 4 tasks concurrently
-        }
-    }
-
-    /// Add task to queue
-    pub async fn add_task(&self, task: GPUProcessingTask) -> Result<()> {
-        let mut queue = self.task_queue.write().await;
-        queue.push(task.clone());
+    pub fn new() -> (Self, mpsc::Receiver<SchedulerEvent>) {
+        let (scheduler_events, scheduler_rx) = mpsc::channel(100);
         
-        // Sort by priority
-        queue.sort_by(|a, b| {
-            let priority_order = |p: &TaskPriority| match p {
-                TaskPriority::Critical => 0,
-                TaskPriority::High => 1,
-                TaskPriority::Normal => 2,
-                TaskPriority::Low => 3,
-            };
-            priority_order(&a.priority).cmp(&priority_order(&b.priority))
-        });
-
-        tracing::info!("Added GPU task {} to queue (priority: {:?})", task.task_id, task.priority);
+        let scheduler = Self {
+            available_gpus: Arc::new(RwLock::new(HashMap::new())),
+            task_queue: Arc::new(RwLock::new(Vec::new())),
+            active_tasks: Arc::new(RwLock::new(HashMap::new())),
+            completed_tasks: Arc::new(RwLock::new(HashMap::new())),
+            scheduler_events,
+        };
+        
+        (scheduler, scheduler_rx)
+    }
+    
+    /// Register a GPU node with the scheduler
+    pub async fn register_gpu(&self, node_id: String, capability: GPUCapability) -> Result<()> {
+        {
+            let mut gpus = self.available_gpus.write().await;
+            gpus.insert(node_id.clone(), capability.clone());
+        }
+        
+        // Send registration event
+        if let Err(e) = self.scheduler_events.send(SchedulerEvent::GPURegistered(node_id.clone(), capability.clone())).await {
+            tracing::warn!("Failed to send GPU registration event: {}", e);
+        }
+        
+        tracing::info!("Registered GPU node {} with {} compute units", node_id, capability.compute_units);
         Ok(())
     }
-
-    /// Process next task in queue
-    pub async fn process_next_task(&self) -> Result<Option<GPUProcessingResult>> {
-        let mut queue = self.task_queue.write().await;
+    
+    /// Submit a GPU processing task
+    pub async fn submit_task(&self, task: GPUProcessingTask) -> Result<()> {
+        {
+            let mut queue = self.task_queue.write().await;
+            queue.push(task.clone());
+        }
         
-        if let Some(task) = queue.pop() {
-            drop(queue); // Release lock before processing
-            
-            let result = self.gpu_processor.process_parallel_computation(&task).await?;
-            
-            // Store completed task
-            {
-                let mut completed = self.completed_tasks.write().await;
-                completed.insert(task.task_id.clone(), result.clone());
+        tracing::info!("Submitted GPU task {} with {:?} complexity", task.id, task.complexity);
+        
+        // Try to assign task immediately
+        self.try_assign_pending_tasks().await?;
+        
+        Ok(())
+    }
+    
+    /// Try to assign pending tasks to available GPUs
+    async fn try_assign_pending_tasks(&self) -> Result<()> {
+        let mut queue = self.task_queue.write().await;
+        let gpus = self.available_gpus.read().await;
+        let mut active_tasks = self.active_tasks.write().await;
+        
+        let mut assigned_count = 0;
+        
+        // Sort tasks by priority and deadline
+        queue.sort_by(|a, b| {
+            // First by deadline (earlier deadline = higher priority)
+            let deadline_cmp = a.deadline.cmp(&b.deadline);
+            if deadline_cmp != std::cmp::Ordering::Equal {
+                return deadline_cmp;
             }
             
-            tracing::info!("Processed GPU task {} in {}ms", task.task_id, result.processing_time_ms);
-            Ok(Some(result))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Get queue statistics
-    pub async fn get_queue_stats(&self) -> QueueStats {
-        let queue = self.task_queue.read().await;
-        let completed = self.completed_tasks.read().await;
+            // Then by task ID for consistency
+            a.id.cmp(&b.id)
+        });
         
-        QueueStats {
+        let mut i = 0;
+        while i < queue.len() {
+            let task_id = queue[i].id;
+            let task = &queue[i];
+            
+            // Find best GPU for this task
+            if let Some((node_id, capability)) = self.find_best_gpu_for_task(task, &gpus).await {
+                // Check if GPU can handle the task
+                if self.can_gpu_handle_task(task, &capability).await {
+                    // Assign task to GPU
+                    let mut assigned_task = task.clone();
+                    assigned_task.assigned_node = Some(node_id.clone());
+                    assigned_task.status = TaskStatus::Assigned;
+                    
+                    // Add to active tasks
+                    active_tasks.insert(task_id, assigned_task);
+                    
+                    // Remove from queue
+                    queue.remove(i);
+                    
+                    // Send assignment event
+                    if let Err(e) = self.scheduler_events.send(SchedulerEvent::TaskAssigned(task_id, node_id)).await {
+                        tracing::warn!("Failed to send task assignment event: {}", e);
+                    }
+                    
+                    assigned_count += 1;
+                    continue; // Don't increment i since we removed an element
+                }
+            }
+            
+            i += 1;
+        }
+        
+        if assigned_count > 0 {
+            tracing::info!("Assigned {} GPU tasks to available nodes", assigned_count);
+        }
+        
+        Ok(())
+    }
+    
+    /// Find the best GPU for a given task
+    async fn find_best_gpu_for_task(
+        &self,
+        task: &GPUProcessingTask,
+        gpus: &HashMap<String, GPUCapability>
+    ) -> Option<(String, GPUCapability)> {
+        let mut best_gpu: Option<(String, GPUCapability)> = None;
+        let mut best_score = 0.0;
+        
+        for (node_id, capability) in gpus.iter() {
+            let score = self.calculate_gpu_fitness_score(task, capability).await;
+            
+            if score > best_score {
+                best_score = score;
+                best_gpu = Some((node_id.clone(), capability.clone()));
+            }
+        }
+        
+        best_gpu
+    }
+    
+    /// Calculate fitness score for GPU-task pairing
+    async fn calculate_gpu_fitness_score(&self, task: &GPUProcessingTask, capability: &GPUCapability) -> f64 {
+        let score = capability.benchmark_score;
+        
+        // Complexity matching bonus
+        let complexity_bonus = match (task.complexity.clone(), capability.compute_units) {
+            (TaskComplexity::Simple, _) => 1.0,
+            (TaskComplexity::Moderate, units) if units >= 2 => 1.2,
+            (TaskComplexity::Complex, units) if units >= 4 => 1.5,
+            (TaskComplexity::Extreme, units) if units >= 8 => 2.0,
+            _ => 0.5, // Penalty for mismatched complexity
+        };
+        
+        // Memory requirement bonus
+        let memory_bonus = if capability.memory_gb >= 4.0 { 1.1 } else { 0.9 };
+        
+        score * complexity_bonus * memory_bonus
+    }
+    
+    /// Check if GPU can handle the task
+    async fn can_gpu_handle_task(&self, task: &GPUProcessingTask, capability: &GPUCapability) -> bool {
+        // Check compute units requirement
+        let required_units = match task.complexity {
+            TaskComplexity::Simple => 1,
+            TaskComplexity::Moderate => 2,
+            TaskComplexity::Complex => 4,
+            TaskComplexity::Extreme => 8,
+        };
+        
+        if capability.compute_units < required_units {
+            return false;
+        }
+        
+        // Check memory requirement (rough estimate)
+        let estimated_memory_gb = (task.input_data.len() * 4) as f32 / 1_000_000_000.0; // 4 bytes per f32
+        if capability.memory_gb < estimated_memory_gb * 2.0 { // 2x buffer
+            return false;
+        }
+        
+        true
+    }
+    
+    /// Get scheduler statistics
+    pub async fn get_stats(&self) -> SchedulerStats {
+        let queue = self.task_queue.read().await;
+        let active = self.active_tasks.read().await;
+        let completed = self.completed_tasks.read().await;
+        let gpus = self.available_gpus.read().await;
+        
+        SchedulerStats {
             pending_tasks: queue.len(),
+            active_tasks: active.len(),
             completed_tasks: completed.len(),
-            queue_utilization: queue.len() as f64 / self.max_concurrent_tasks as f64,
+            available_gpus: gpus.len(),
+            total_compute_units: gpus.values().map(|g| g.compute_units).sum(),
+            average_benchmark_score: gpus.values().map(|g| g.benchmark_score).sum::<f64>() / gpus.len() as f64,
         }
     }
 }
 
-/// Queue statistics
+/// Scheduler statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueueStats {
+pub struct SchedulerStats {
     pub pending_tasks: usize,
+    pub active_tasks: usize,
     pub completed_tasks: usize,
-    pub queue_utilization: f64,
+    pub available_gpus: usize,
+    pub total_compute_units: u32,
+    pub average_benchmark_score: f64,
+}
+
+/// GPU processor for individual nodes
+pub struct GPUProcessor {
+    node_id: String,
+    capability: GPUCapability,
+    current_task: Option<GPUProcessingTask>,
+    task_events: mpsc::Sender<TaskEvent>,
+}
+
+/// Task events for GPU processing
+#[derive(Debug, Clone)]
+pub enum TaskEvent {
+    TaskStarted(Uuid),
+    TaskProgress(Uuid, f32), // Progress percentage
+    TaskCompleted(Uuid, TaskResult),
+    TaskFailed(Uuid, String),
+}
+
+impl GPUProcessor {
+    /// Create a new GPU processor
+    pub async fn new(node_id: String, capability: GPUCapability) -> Result<Self> {
+        let (task_events, _) = mpsc::channel(100);
+        
+        Ok(Self {
+            node_id,
+            capability,
+            current_task: None,
+            task_events,
+        })
+    }
+    
+    /// Process a GPU task
+    pub async fn process_task(&mut self, task: GPUProcessingTask) -> Result<TaskResult> {
+        // Send task started event
+        if let Err(e) = self.task_events.send(TaskEvent::TaskStarted(task.id)).await {
+            tracing::warn!("Failed to send task started event: {}", e);
+        }
+        
+        self.current_task = Some(task.clone());
+        
+        let start_time = SystemTime::now();
+        
+        // Simulate GPU processing based on task complexity
+        let _processing_time = self.simulate_gpu_processing(&task).await?;
+        
+        // Generate result data
+        let result_data = self.generate_result_data(&task).await?;
+        
+        let end_time = SystemTime::now();
+        let actual_processing_time = end_time.duration_since(start_time).unwrap();
+        
+        let result = TaskResult {
+            task_id: task.id,
+            result_data,
+            processing_time: actual_processing_time,
+            node_id: self.node_id.clone(),
+            confidence_score: self.calculate_confidence_score(&task).await,
+            metadata: HashMap::new(),
+        };
+        
+        // Send task completed event
+        if let Err(e) = self.task_events.send(TaskEvent::TaskCompleted(task.id, result.clone())).await {
+            tracing::warn!("Failed to send task completed event: {}", e);
+        }
+        
+        self.current_task = None;
+        
+        tracing::info!("Completed GPU task {} in {:?}", task.id, actual_processing_time);
+        Ok(result)
+    }
+    
+    /// Simulate GPU processing time
+    async fn simulate_gpu_processing(&self, task: &GPUProcessingTask) -> Result<Duration> {
+        let base_time = match task.complexity {
+            TaskComplexity::Simple => Duration::from_millis(100),
+            TaskComplexity::Moderate => Duration::from_millis(500),
+            TaskComplexity::Complex => Duration::from_millis(2000),
+            TaskComplexity::Extreme => Duration::from_millis(5000),
+        };
+        
+        // Adjust based on GPU capability
+        let capability_factor = 1.0 / (self.capability.benchmark_score / 1000.0);
+        let adjusted_time = base_time.mul_f64(capability_factor);
+        
+        // Simulate actual processing
+        tokio::time::sleep(adjusted_time).await;
+        
+        Ok(adjusted_time)
+    }
+    
+    /// Generate result data for the task
+    async fn generate_result_data(&self, task: &GPUProcessingTask) -> Result<Vec<f32>> {
+        // Simulate GPU computation result
+        let mut result = Vec::with_capacity(task.expected_output_size);
+        
+        for i in 0..task.expected_output_size {
+            // Simple computation simulation
+            let input_value = if i < task.input_data.len() {
+                task.input_data[i]
+        } else {
+                0.0
+            };
+            
+            // Apply some computation (e.g., multiply by GPU capability factor)
+            let computed_value = input_value * (self.capability.benchmark_score / 1000.0) as f32;
+            result.push(computed_value);
+        }
+        
+        Ok(result)
+    }
+    
+    /// Calculate confidence score for the result
+    async fn calculate_confidence_score(&self, task: &GPUProcessingTask) -> f64 {
+        let base_confidence = 0.95;
+        
+        // Adjust based on GPU capability
+        let capability_bonus = (self.capability.benchmark_score / 1000.0).min(0.05);
+        
+        // Adjust based on task complexity
+        let complexity_bonus = match task.complexity {
+            TaskComplexity::Simple => 0.02,
+            TaskComplexity::Moderate => 0.01,
+            TaskComplexity::Complex => 0.0,
+            TaskComplexity::Extreme => -0.01,
+        };
+        
+        (base_confidence + capability_bonus + complexity_bonus).max(0.8).min(1.0)
+    }
+    
+    /// Get current GPU status
+    pub fn get_status(&self) -> GPUStatus {
+        GPUStatus {
+            node_id: self.node_id.clone(),
+            capability: self.capability.clone(),
+            is_processing: self.current_task.is_some(),
+            current_task_id: self.current_task.as_ref().map(|t| t.id),
+        }
+    }
+}
+
+/// GPU status information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GPUStatus {
+    pub node_id: String,
+    pub capability: GPUCapability,
+    pub is_processing: bool,
+    pub current_task_id: Option<Uuid>,
 }
 
 #[cfg(test)]
@@ -631,24 +436,31 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_gpu_processor_creation() {
-        // This test requires a GPU, so it might fail in CI environments
-        match GPUProcessor::new().await {
-            Ok(processor) => {
-                assert!(processor.is_initialized);
-                assert!(processor.capabilities.supports_compute_shaders);
-            }
-            Err(_) => {
-                // GPU not available, skip test
-                tracing::warn!("GPU not available, skipping GPU processor test");
-            }
-        }
+    async fn test_gpu_scheduler_creation() {
+        let (scheduler, _) = GPUTaskScheduler::new();
+        let stats = scheduler.get_stats().await;
+        
+        assert_eq!(stats.pending_tasks, 0);
+        assert_eq!(stats.available_gpus, 0);
     }
 
     #[tokio::test]
-    async fn test_task_scheduler() {
-        // Skip this test for now as it requires mock GPU components
-        tracing::warn!("Skipping GPU task scheduler test - requires mock GPU components");
-        return;
+    async fn test_gpu_registration() {
+        let (scheduler, _) = GPUTaskScheduler::new();
+        
+        let capability = GPUCapability {
+            compute_units: 8,
+            memory_gb: 16.0,
+            compute_capability: 8.6,
+            max_workgroup_size: 1024,
+            supported_extensions: vec!["compute".to_string()],
+            benchmark_score: 8500.0,
+        };
+        
+        scheduler.register_gpu("gpu1".to_string(), capability).await.unwrap();
+        
+        let stats = scheduler.get_stats().await;
+        assert_eq!(stats.available_gpus, 1);
+        assert_eq!(stats.total_compute_units, 8);
     }
 }

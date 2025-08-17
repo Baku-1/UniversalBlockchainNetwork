@@ -33,6 +33,8 @@ pub struct ContractTask {
     pub status: TaskStatus,
     pub worker_cohort: Vec<String>,
     pub result_hash: Option<String>,
+    pub minimum_result_size: usize,
+    pub expected_result_hash: Option<Vec<u8>>,
 }
 
 /// Task result with signatures from mesh validators

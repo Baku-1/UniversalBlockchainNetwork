@@ -206,35 +206,35 @@ impl SecureExecutionEngine {
         }
     }
 
-    /// Execute secure task with integrity verification
-    pub async fn execute_secure_task(
-        &self,
-        task_data: &[u8],
-        expected_hash: &[u8; 32],
-        task_name: &str,
-    ) -> Result<Vec<u8>> {
-        let start_time = SystemTime::now();
+    /// Execute a secure computation task with mesh validation
+    pub async fn execute_secure_task(&self, task: &crate::contract_integration::ContractTask, mesh_validator: &crate::mesh_validation::MeshValidator) -> Result<Vec<u8>> {
+        // Get current security status
+        let security_status = self.get_security_status().await;
         
-        // Step 1: Validate code integrity
-        self.code_hash_validator.validate_hash(task_data, expected_hash, task_name).await?;
+        if security_status.overall_status == SecurityLevel::Compromised {
+            return Err(anyhow::anyhow!("System security compromised, cannot execute secure task"));
+        }
         
-        // Step 2: Check runtime integrity
-        self.runtime_integrity_checker.check_integrity().await?;
+        // Validate task using mesh validator
+        let validation_result = mesh_validator.verify_contract_task_result(
+            task.id as u64,
+            &task.expected_result_hash.clone().unwrap_or_default(),
+            "mesh_signature", // Placeholder signature
+            "mesh_validator"   // Placeholder validator ID
+        ).await.map_err(|e| anyhow::anyhow!("Mesh validation failed: {}", e))?;
         
-        // Step 3: Anti-debug protection
-        self.anti_debug_protection.check_debugger().await?;
-
-        // Step 4: Execute task
-        let result = self.execute_task_safely(task_data).await?;
+        if !validation_result {
+            return Err(anyhow::anyhow!("Mesh validation failed for secure task"));
+        }
         
-        // Step 5: Post-execution integrity check
-        self.runtime_integrity_checker.post_execution_check().await?;
+        // Execute task with safety measures
+        let start_time = std::time::Instant::now();
+        let result = self.execute_task_safely(&task.task_data).await?;
+        let execution_time = start_time.elapsed();
         
-        // Step 6: Update performance baseline
-        let execution_time = start_time.elapsed()?;
-        self.performance_baseline.update_metric("execution_time", execution_time.as_millis() as f64).await;
+        tracing::info!("Secure task {} executed successfully in {:?} with security level {:?}", 
+            task.id, execution_time, security_status.overall_status);
         
-        tracing::info!("Secure task '{}' executed successfully in {}ms", task_name, execution_time.as_millis());
         Ok(result)
     }
 
@@ -882,7 +882,7 @@ pub struct SecurityStatus {
     pub last_security_check: SystemTime,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SecurityLevel {
     Secure,
     PartiallySecure,

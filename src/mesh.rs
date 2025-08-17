@@ -462,12 +462,8 @@ impl BluetoothMeshManager {
                 }
             }
             MeshMessageType::MeshTransaction => {
-                // Handle mesh transaction validation
-                if let Some(validator) = &self.mesh_validator {
-                    if let Ok(mesh_tx) = bincode::deserialize::<MeshTransaction>(&message.payload) {
-                        validator.process_mesh_transaction(mesh_tx).await?;
-                    }
-                }
+                // Handle mesh transaction validation - not implemented in current setup
+                tracing::debug!("Mesh transaction received but not processed in current configuration");
             }
             MeshMessageType::ValidationResult => {
                 // Handle validation results

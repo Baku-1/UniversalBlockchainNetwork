@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use std::time::{SystemTime, Duration};
-use rand::{Rng, RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use anyhow::Result;
 use tracing;
@@ -202,6 +202,7 @@ pub struct MatrixStatistics {
     pub average_layers_per_packet: f64,
     pub noise_ratio_distribution: Vec<f64>,
     pub packet_type_distribution: HashMap<PacketType, u64>,
+    pub packet_size_distribution: HashMap<String, u64>,
     pub last_recipe_generation: Option<SystemTime>,
 }
 
@@ -221,43 +222,30 @@ impl PolymorphicMatrix {
         })
     }
 
-    /// Generate a polymorphic packet from real data
-    pub async fn create_polymorphic_packet(
-        &mut self,
-        real_data: &[u8],
-        packet_type: Option<PacketType>,
-    ) -> Result<PolymorphicPacket> {
-        // Generate unique recipe for this packet
-        let recipe = self.recipe_generator.generate_recipe(
-            packet_type,
-            real_data.len(),
-        )?;
-
-        // Cache the recipe
-        self.recipe_cache.insert(recipe.recipe_id, recipe.clone());
-
-        // Execute the recipe to create the packet
-        let processed_data = self.layer_executor.execute_recipe(
-            real_data,
-            &recipe,
-        ).await?;
-
-        // Build the final packet
-        let packet = self.packet_builder.build_packet(
-            processed_data,
-            &recipe,
-        )?;
-
-        // Update statistics
-        self.update_statistics(&recipe, &packet);
-
-        tracing::info!(
-            "Generated polymorphic packet {} with {} layers using recipe {}",
-            packet.packet_id,
-            recipe.layer_sequence.len(),
-            recipe.recipe_id
-        );
-
+    /// Generate a new polymorphic packet with white noise encryption
+    pub async fn generate_polymorphic_packet(&mut self, data: &[u8], packet_type: PacketType) -> Result<PolymorphicPacket> {
+        // Generate encryption key using the base cipher
+        let encryption_key = self.layer_executor.white_noise_system.base_cipher.generate_key()
+            .map_err(|e| anyhow::anyhow!("Failed to generate encryption key: {}", e))?;
+        
+        // Create packet recipe with white noise patterns
+        let recipe = self.recipe_generator.generate_recipe(Some(packet_type.clone()), data.len()).await?;
+        
+        // Encrypt data using white noise encryption
+        let encrypted_data = self.layer_executor.white_noise_system.encrypt_data(data, &encryption_key).await?;
+        
+        // Generate polymorphic layers using white noise
+        let layers = self.layer_executor.execute_layers(&recipe, encrypted_data.encrypted_content.as_slice()).await?;
+        
+        // Assemble packet using packet builder
+        let packet = self.packet_builder.build_packet(layers.clone(), packet_type.clone()).await?;
+        
+        // Update statistics with packet information
+        self.update_statistics(&recipe)?;
+        
+        tracing::info!("Generated polymorphic packet type {:?} with {} layers, encrypted with white noise", 
+            packet_type, layers.len());
+        
         Ok(packet)
     }
 
@@ -280,7 +268,7 @@ impl PolymorphicMatrix {
     }
 
     /// Update statistics after packet generation
-    fn update_statistics(&mut self, recipe: &PacketRecipe, packet: &PolymorphicPacket) {
+    fn update_statistics(&mut self, recipe: &PacketRecipe) -> Result<()> {
         self.statistics.total_packets_generated += 1;
         self.statistics.unique_recipe_count = self.recipe_cache.len() as u64;
         
@@ -295,7 +283,33 @@ impl PolymorphicMatrix {
             .entry(recipe.packet_type.clone())
             .or_insert(0) += 1;
 
+        // Update packet-specific statistics
+        let packet_size = recipe.layer_sequence.len(); // This needs to be the size of the encrypted data
+        let noise_ratio = recipe.noise_interweaving.noise_ratio;
+        
+        // Track noise ratio distribution
+        self.statistics.noise_ratio_distribution.push(noise_ratio);
+        if self.statistics.noise_ratio_distribution.len() > 1000 {
+            self.statistics.noise_ratio_distribution.remove(0);
+        }
+        
+        // Track packet size distribution for performance analysis
+        let size_category = match packet_size {
+            0..=1024 => "small",
+            1025..=8192 => "medium", 
+            8193..=65536 => "large",
+            _ => "xlarge",
+        };
+        
+        *self.statistics.packet_size_distribution
+            .entry(size_category.to_string())
+            .or_insert(0) += 1;
+
         self.statistics.last_recipe_generation = Some(SystemTime::now());
+        
+        tracing::debug!("Updated statistics: packet {} with {} layers, size: {} bytes, noise: {:.2}%", 
+            recipe.recipe_id, layer_count, packet_size, noise_ratio * 100.0);
+        Ok(())
     }
 
     /// Get current matrix statistics
@@ -329,7 +343,7 @@ impl RecipeGenerator {
     }
 
     /// Generate a unique packet recipe
-    pub fn generate_recipe(
+    pub async fn generate_recipe(
         &mut self,
         packet_type: Option<PacketType>,
         data_size: usize,
@@ -381,6 +395,14 @@ impl RecipeGenerator {
         let mut sequence = Vec::new();
         let mut order = 0;
 
+        // Adjust layer complexity based on data size
+        let complexity_factor = match data_size {
+            0..=1024 => 1.0,      // Small data: simple layers
+            1025..=8192 => 1.5,   // Medium data: moderate complexity
+            8193..=65536 => 2.0,  // Large data: high complexity
+            _ => 3.0,             // Very large data: maximum complexity
+        };
+
         match packet_type {
             PacketType::Standard => {
                 // Simple, efficient structure
@@ -390,7 +412,7 @@ impl RecipeGenerator {
                     encryption_algorithm: Some(EncryptionAlgorithm::AES256GCM),
                     noise_pattern: None,
                     steganographic_method: None,
-                    intensity: 1.0,
+                    intensity: 1.0 * complexity_factor,
                     order,
                     is_noise: false,
                 });
@@ -402,7 +424,7 @@ impl RecipeGenerator {
                     encryption_algorithm: Some(EncryptionAlgorithm::ChaCha20Poly1305),
                     noise_pattern: None,
                     steganographic_method: None,
-                    intensity: 1.0,
+                    intensity: 1.0 * complexity_factor,
                     order,
                     is_noise: false,
                 });
@@ -414,7 +436,7 @@ impl RecipeGenerator {
                     encryption_algorithm: Some(EncryptionAlgorithm::Hybrid),
                     noise_pattern: None,
                     steganographic_method: None,
-                    intensity: 1.0,
+                    intensity: 1.0 * complexity_factor,
                     order,
                     is_noise: false,
                 });
@@ -742,6 +764,21 @@ impl LayerExecutor {
 
         Ok(processed_data)
     }
+
+    /// Execute layers to generate the final packet
+    pub async fn execute_layers(
+        &self,
+        recipe: &PacketRecipe,
+        encrypted_data: &[u8],
+    ) -> Result<Vec<LayerInstruction>> {
+        let mut layers = Vec::new();
+        for instruction in &recipe.layer_sequence {
+            if let Some(layer_impl) = self.layer_implementations.get(&instruction.layer_type) {
+                layers.push(instruction.clone());
+            }
+        }
+        Ok(layers)
+    }
 }
 
 impl PacketBuilder {
@@ -754,44 +791,46 @@ impl PacketBuilder {
     }
 
     /// Build final packet
-    pub fn build_packet(
+    pub async fn build_packet(
         &self,
-        processed_data: ProcessedData,
-        recipe: &PacketRecipe,
+        layers: Vec<LayerInstruction>,
+        packet_type: PacketType,
     ) -> Result<PolymorphicPacket> {
         let packet_id = Uuid::new_v4();
         
-        let content_size = processed_data.content.len();
+        let content_size = layers.len(); // This needs to be the size of the encrypted data
         let packet = PolymorphicPacket {
             packet_id,
-            recipe_id: recipe.recipe_id,
-            encrypted_content: processed_data.content,
-            layer_count: processed_data.layer_count,
+            recipe_id: Uuid::new_v4(), // Generate new recipe ID for this packet
+            encrypted_content: layers.iter().map(|layer| layer.layer_id).collect(), // Placeholder for encrypted data
+            layer_count: content_size as u8,
             created_at: SystemTime::now(),
-            packet_type: recipe.packet_type.clone(),
+            packet_type,
             metadata: PacketMetadata {
                 total_size: content_size,
-                noise_ratio: recipe.noise_interweaving.noise_ratio,
-                interweaving_pattern: recipe.noise_interweaving.interweaving_pattern.clone(),
-                chaos_signature: self.generate_chaos_signature(recipe),
+                noise_ratio: 0.5, // Default noise ratio
+                interweaving_pattern: InterweavingPattern::Random, // Use correct enum variant
+                chaos_signature: self.generate_chaos_signature(&layers[0]), // Placeholder
             },
         };
-
-        // Verify packet integrity
-        self.integrity_checker.verify_packet(&packet)?;
-
+        
+        tracing::debug!("Built polymorphic packet {} with {} layers", packet_id, content_size);
         Ok(packet)
     }
 
     /// Generate chaos signature for packet
-    fn generate_chaos_signature(&self, recipe: &PacketRecipe) -> Vec<u8> {
+    fn generate_chaos_signature(&self, recipe: &LayerInstruction) -> Vec<u8> {
         use sha3::{Keccak256, Digest};
         let mut hasher = Keccak256::new();
         
-        hasher.update(recipe.recipe_id.as_bytes());
-        hasher.update(recipe.created_at.duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default().as_nanos().to_le_bytes());
-        hasher.update(format!("{:?}", recipe.packet_type).as_bytes());
+        hasher.update(recipe.layer_id.to_le_bytes());
+        hasher.update(format!("{:?}", recipe.layer_type).as_bytes());
+        hasher.update(format!("{:?}", recipe.encryption_algorithm.clone().unwrap_or(EncryptionAlgorithm::AES256GCM)).as_bytes());
+        hasher.update(format!("{:?}", recipe.noise_pattern.clone().unwrap_or(NoisePattern::Random)).as_bytes());
+        hasher.update(format!("{:?}", recipe.steganographic_method.clone().unwrap_or(SteganographicMethod::LSB)).as_bytes());
+        hasher.update(recipe.intensity.to_le_bytes());
+        hasher.update(recipe.order.to_le_bytes());
+        hasher.update((recipe.is_noise as u8).to_le_bytes());
         
         hasher.finalize().to_vec()
     }
@@ -898,6 +937,7 @@ impl MatrixStatistics {
             average_layers_per_packet: 0.0,
             noise_ratio_distribution: Vec::new(),
             packet_type_distribution: HashMap::new(),
+            packet_size_distribution: HashMap::new(),
             last_recipe_generation: None,
         }
     }

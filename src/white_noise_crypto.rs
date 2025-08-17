@@ -1,7 +1,7 @@
 // src/white_noise_crypto.rs
 
 use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit}};
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit as ChaChaKeyInit};
+use chacha20poly1305::ChaCha20Poly1305;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tracing;

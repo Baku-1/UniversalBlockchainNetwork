@@ -559,6 +559,27 @@ impl CrossChainTokenRegistry {
             },
         }
     }
+
+    /// Record contract task received
+    pub async fn record_contract_task(&self, task_id: u64) -> Result<()> {
+        tracing::debug!("Recorded contract task received: {}", task_id);
+        // Could implement task tracking logic here
+        Ok(())
+    }
+
+    /// Record contract task processed
+    pub async fn record_task_processed(&self, task_id: u64) -> Result<()> {
+        tracing::debug!("Recorded contract task processed: {}", task_id);
+        // Could implement task completion tracking here
+        Ok(())
+    }
+
+    /// Record result submitted for contract task
+    pub async fn record_result_submitted(&self, task_id: u64, tx_hash: String) -> Result<()> {
+        tracing::info!("Recorded result submitted for task {}: {}", task_id, tx_hash);
+        // Could implement result tracking logic here
+        Ok(())
+    }
 }
 
 /// Token mapping update structure

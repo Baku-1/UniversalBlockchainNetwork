@@ -7,6 +7,8 @@ use tokio::sync::RwLock;
 use std::sync::Arc;
 use anyhow::Result;
 use tracing;
+use uuid::Uuid;
+use crate::lending_pools;
 
 /// Network statistics for economic calculations
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +31,7 @@ pub struct InterestRateEngine {
     pub network_utilization_factor: f64,
     pub historical_rates: Arc<RwLock<Vec<(SystemTime, f64)>>>,
     pub rate_adjustment_history: Arc<RwLock<Vec<RateAdjustment>>>,
+    pub rate_network_correlation: Arc<RwLock<Vec<RateNetworkCorrelation>>>,
 }
 
 /// Rate adjustment record for transparency
@@ -39,6 +42,16 @@ pub struct RateAdjustment {
     pub new_rate: f64,
     pub reason: String,
     pub network_stats: NetworkStats,
+}
+
+/// Rate and network correlation data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateNetworkCorrelation {
+    pub timestamp: SystemTime,
+    pub rate: f64,
+    pub network_utilization: f64,
+    pub active_peers: u32,
+    pub transaction_volume: u64,
 }
 
 /// Lending pool for automated distribution
@@ -87,6 +100,15 @@ pub struct InterestPayment {
     pub payment_hash: Option<String>,
 }
 
+/// Lending eligibility assessment for transactions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LendingEligibility {
+    pub eligible: bool,
+    pub loan_amount: u64,
+    pub interest_rate: f64,
+    pub collateral_ratio: f64,
+}
+
 /// Collateral requirements for loans
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollateralRequirements {
@@ -105,6 +127,7 @@ impl InterestRateEngine {
             network_utilization_factor: 1.0,
             historical_rates: Arc::new(RwLock::new(Vec::new())),
             rate_adjustment_history: Arc::new(RwLock::new(Vec::new())),
+            rate_network_correlation: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -193,7 +216,23 @@ impl InterestRateEngine {
             history.remove(0);
         }
         
-        tracing::info!("Interest rate adjusted to {:.3}% based on network stats", new_rate * 100.0);
+        // Record network stats correlation with rate change
+        let mut correlation_history = self.rate_network_correlation.write().await;
+        correlation_history.push(RateNetworkCorrelation {
+            timestamp: SystemTime::now(),
+            rate: new_rate,
+            network_utilization: network_stats.network_utilization,
+            active_peers: network_stats.active_users as u32,
+            transaction_volume: network_stats.total_transactions,
+        });
+        
+        // Keep only last 500 correlations
+        if correlation_history.len() > 500 {
+            correlation_history.remove(0);
+        }
+        
+        tracing::info!("Interest rate adjusted to {:.3}% based on network stats (utilization: {:.2}%, peers: {})", 
+            new_rate * 100.0, network_stats.network_utilization * 100.0, network_stats.active_users);
     }
 
     /// Get rate history for analysis
@@ -370,6 +409,7 @@ pub struct EconomicEngine {
     pub lending_pools: Arc<RwLock<HashMap<String, LendingPool>>>,
     pub network_stats: Arc<RwLock<NetworkStats>>,
     pub collateral_requirements: CollateralRequirements,
+    pub token_distribution: Arc<RwLock<HashMap<String, u64>>>,
 }
 
 impl EconomicEngine {
@@ -394,6 +434,7 @@ impl EconomicEngine {
                 maintenance_margin: 1.15,
                 risk_adjustment: 0.1,
             },
+            token_distribution: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -439,6 +480,140 @@ impl EconomicEngine {
             current_lending_rate: self.interest_rate_engine.calculate_lending_rate(&network_stats).await,
             pool_count: pools.len(),
         }
+    }
+
+    /// Record successful transaction settlement
+    pub async fn record_transaction_settled(&self, tx_id: Uuid) -> Result<()> {
+        let mut stats = self.network_stats.write().await;
+        stats.total_transactions += 1;
+        tracing::debug!("Recorded successful settlement for transaction: {}", tx_id);
+        Ok(())
+    }
+
+    /// Record transaction settlement with details for economic analysis
+    pub async fn record_transaction_settled_with_details(
+        &self, 
+        amount: u64, 
+        token_type: String, 
+        from_address: String, 
+        to_address: String
+    ) -> Result<()> {
+        let mut stats = self.network_stats.write().await;
+        stats.total_transactions += 1;
+        
+        // Update average transaction value
+        let current_total = stats.average_transaction_value * (stats.total_transactions - 1);
+        stats.average_transaction_value = (current_total + amount) / stats.total_transactions;
+        
+                // Record token type distribution for economic analysis
+        let mut token_stats = self.token_distribution.write().await;
+        *token_stats.entry(token_type.clone()).or_insert(0) += 1;
+
+        tracing::debug!("Recorded transaction settlement: {} {} from {} to {}",
+            amount, token_type, from_address, to_address);
+        Ok(())
+    }
+
+    /// Record failed transaction settlement
+    pub async fn record_transaction_failed(&self, tx_id: Uuid, error: &str) -> Result<()> {
+        tracing::warn!("Recorded failed settlement for transaction {}: {}", tx_id, error);
+        // Could implement retry logic or failure analysis here
+        Ok(())
+    }
+
+    /// Record batch settlement completion
+    pub async fn record_batch_settlement(&self, count: usize) -> Result<()> {
+        let mut stats = self.network_stats.write().await;
+        stats.total_transactions += count as u64;
+        tracing::info!("Recorded batch settlement of {} transactions", count);
+        Ok(())
+    }
+
+    /// Record incentive earned from store & forward
+    pub async fn record_incentive_earned(&self, amount: u64) -> Result<()> {
+        tracing::info!("Recorded incentive earned: {} RON", amount);
+        // Could implement incentive distribution logic here
+        Ok(())
+    }
+
+    /// Set lending pools manager for automated distribution
+    pub async fn set_lending_pools(&self, lending_pools: Arc<lending_pools::LendingPoolManager>) -> Result<()> {
+        // Store reference to lending pools for economic operations
+        // TODO: Store the lending_pools reference for future use in economic calculations
+        tracing::info!("Lending pools connected to economic engine (manager: {:?})", 
+            std::any::type_name_of_val(&*lending_pools));
+        Ok(())
+    }
+
+    /// Record lending pool events for economic analysis
+    pub async fn record_pool_created(&self, pool_id: String) -> Result<()> {
+        tracing::info!("Economic engine recorded pool creation: {}", pool_id);
+        Ok(())
+    }
+
+    pub async fn record_loan_created(&self, loan_id: String, borrower: String) -> Result<()> {
+        let mut stats = self.network_stats.write().await;
+        stats.total_lending_volume += 1;
+        tracing::info!("Economic engine recorded loan creation: {} for {}", loan_id, borrower);
+        Ok(())
+    }
+
+    pub async fn record_loan_repaid(&self, loan_id: String, borrower: String) -> Result<()> {
+        tracing::info!("Economic engine recorded loan repayment: {} by {}", loan_id, borrower);
+        Ok(())
+    }
+
+    pub async fn record_loan_defaulted(&self, loan_id: String, borrower: String) -> Result<()> {
+        tracing::warn!("Economic engine recorded loan default: {} by {}", loan_id, borrower);
+        Ok(())
+    }
+
+    pub async fn record_interest_paid(&self, loan_id: String, amount: u64) -> Result<()> {
+        tracing::info!("Economic engine recorded interest payment: {} RON for loan {}", amount, loan_id);
+        Ok(())
+    }
+
+    pub async fn record_pool_liquidated(&self, pool_id: String) -> Result<()> {
+        tracing::warn!("Economic engine recorded pool liquidation: {}", pool_id);
+        Ok(())
+    }
+
+    /// Record distributed computing events for economic analysis
+    pub async fn record_distributed_computing_task(&self, task_id: Uuid, node_count: usize) -> Result<()> {
+        tracing::info!("Economic engine recorded distributed computing task: {} with {} nodes", task_id, node_count);
+        Ok(())
+    }
+
+    pub async fn record_distributed_computing_completed(&self, task_id: Uuid, node_count: usize) -> Result<()> {
+        tracing::info!("Economic engine recorded distributed computing completion: {} with {} nodes", task_id, node_count);
+        Ok(())
+    }
+
+    pub async fn record_distributed_computing_failed(&self, task_id: Uuid, error: String) -> Result<()> {
+        tracing::warn!("Economic engine recorded distributed computing failure: {} - {}", task_id, error);
+        Ok(())
+    }
+
+    /// Record lending pool activity for economic analysis
+    pub async fn record_lending_pool_activity(&self, transaction_id: String, transaction_amount: u64, loan_amount: u64, interest_rate: f64) -> Result<()> {
+        let mut stats = self.network_stats.write().await;
+        stats.total_lending_volume += loan_amount;
+        stats.total_borrowing_volume += loan_amount;
+        
+        // Update average transaction value if this transaction qualifies for lending
+        if loan_amount > 0 {
+            let total_tx = stats.total_transactions;
+            let current_avg = stats.average_transaction_value;
+            stats.average_transaction_value = if total_tx > 0 {
+                ((current_avg * total_tx) + transaction_amount) / (total_tx + 1)
+            } else {
+                transaction_amount
+            };
+        }
+        
+        tracing::info!("Economic engine recorded lending pool activity: transaction {} ({} RON) generated {} RON loan at {:.2}% interest",
+            transaction_id, transaction_amount, loan_amount, interest_rate * 100.0);
+        Ok(())
     }
 }
 

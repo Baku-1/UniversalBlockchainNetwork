@@ -11,6 +11,7 @@ pub mod errors;
 // NEW MODULES FOR FINAL 5% IMPLEMENTATION
 pub mod economic_engine;
 pub mod token_registry;
+pub mod lending_pools;
 pub mod gpu_processor;
 pub mod task_distributor;
 pub mod secure_execution;
@@ -44,10 +45,11 @@ pub use errors::{NexusError, ErrorContext};
 pub use aura_protocol::{AuraProtocolClient, ValidationTask, TaskStatus, TaskResult};
 
 // NEW EXPORTS FOR FINAL 5% IMPLEMENTATION
-pub use economic_engine::{EconomicEngine, InterestRateEngine, LendingPool, NetworkStats, EconomicStats};
+pub use economic_engine::{EconomicEngine, InterestRateEngine, NetworkStats, EconomicStats};
 pub use token_registry::{CrossChainTokenRegistry, BlockchainNetwork, TokenMapping, CrossChainTransfer};
+pub use lending_pools::{LendingPoolManager, LendingPool, LoanDetails, PoolStats, ManagerStats};
 pub use gpu_processor::{GPUProcessor, GPUTaskScheduler, GPUCapability, GPUProcessingTask};
-pub use task_distributor::{TaskDistributor, DeviceCapability, TaskComplexity, LoadBalancingStrategy};
+pub use task_distributor::{TaskDistributor, DeviceCapability, BalancingStrategy};
 pub use secure_execution::{SecureExecutionEngine, SecurityStatus, SecurityLevel, SecurityAuditResult};
 pub use white_noise_crypto::{WhiteNoiseEncryption, WhiteNoiseConfig, EncryptionAlgorithm, NoisePattern};
 pub use polymorphic_matrix::{PolymorphicMatrix, PacketRecipe, PolymorphicPacket, PacketType, LayerType};

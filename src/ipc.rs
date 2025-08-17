@@ -5,7 +5,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use serde_json::json;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
@@ -96,6 +96,17 @@ pub enum IpcMessage {
         message: String,
         code: Option<u32>,
     },
+}
+
+/// Enhanced IPC events for full client communication
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EnhancedIpcEvent {
+    /// Client connected to enhanced IPC
+    ClientConnected(String),
+    /// Client disconnected from enhanced IPC
+    ClientDisconnected(String),
+    /// Command received from client
+    CommandReceived(IpcMessage),
 }
 
 /// Connection statistics for monitoring
@@ -615,6 +626,21 @@ impl IpcServer {
             stats.connected_clients = stats.connected_clients.saturating_sub((-delta) as usize);
         }
     }
+
+    /// Process command from enhanced IPC
+    pub async fn process_command(&self, command: IpcMessage) -> Result<(), Box<dyn std::error::Error>> {
+        match command {
+            IpcMessage::Command { command, params } => {
+                let response = handle_command_enhanced(&command, params).await;
+                tracing::debug!("Processed enhanced IPC command: {:?}", response);
+                Ok(())
+            }
+            _ => {
+                tracing::warn!("Unknown command type in enhanced IPC: {:?}", command);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Enhanced command handler with better error handling
@@ -668,32 +694,46 @@ async fn handle_command_enhanced(command: &str, _params: Option<serde_json::Valu
 }
 
 /// Start IPC server with enhanced ping/pong functionality
-pub async fn start_enhanced_ipc_server(port: u16) -> Result<()> {
+pub async fn start_enhanced_ipc_server(port: u16) -> Result<mpsc::Receiver<EnhancedIpcEvent>> {
     let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr).await?;
     let server = Arc::new(IpcServer::new());
+    
+    // Create channel for enhanced IPC events
+    let (event_tx, event_rx) = mpsc::channel(100);
 
     tracing::info!("Enhanced IPC server listening on {}", addr);
 
-    while let Ok((stream, addr)) = listener.accept().await {
-        let server_clone = Arc::clone(&server);
-        tokio::spawn(async move {
-            if let Err(e) = handle_enhanced_connection(stream, server_clone).await {
-                tracing::error!("Error handling connection from {}: {}", addr, e);
-            }
-        });
-    }
+    // Spawn server task
+    let event_tx_clone = event_tx.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, addr)) = listener.accept().await {
+            let server_clone = Arc::clone(&server);
+            let event_tx = event_tx_clone.clone();
+            
+            tokio::spawn(async move {
+                if let Err(e) = handle_enhanced_connection(stream, server_clone, event_tx).await {
+                    tracing::error!("Error handling connection from {}: {}", addr, e);
+                }
+            });
+        }
+    });
 
-    Ok(())
+    Ok(event_rx)
 }
 
 /// Handle enhanced WebSocket connection with ping/pong
-async fn handle_enhanced_connection(stream: TcpStream, server: Arc<IpcServer>) -> Result<()> {
+async fn handle_enhanced_connection(stream: TcpStream, server: Arc<IpcServer>, event_tx: mpsc::Sender<EnhancedIpcEvent>) -> Result<()> {
     let websocket = accept_async(stream).await?;
     let (mut ws_sender, mut ws_receiver) = websocket.split();
 
     // Update client count
     server.update_client_count(1).await;
+
+            // Send client connection event
+        let _ = event_tx.send(EnhancedIpcEvent::ClientConnected(
+            uuid::Uuid::new_v4().to_string()
+        )).await;
 
     // Send initial status
     let status = ENGINE_STATUS.read().await.clone();
@@ -735,6 +775,12 @@ async fn handle_enhanced_connection(stream: TcpStream, server: Arc<IpcServer>) -
 
     // Update client count on disconnect
     server.update_client_count(-1).await;
+    
+            // Send client disconnection event
+        let _ = event_tx.send(EnhancedIpcEvent::ClientDisconnected(
+            "disconnected".to_string()
+        )).await;
+    
     Ok(())
 }
 
