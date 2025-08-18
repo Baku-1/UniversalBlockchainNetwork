@@ -234,17 +234,20 @@ impl PolymorphicMatrix {
         // Encrypt data using white noise encryption
         let encrypted_data = self.layer_executor.white_noise_system.encrypt_data(data, &encryption_key).await?;
         
-        // Generate polymorphic layers using white noise
-        let layers = self.layer_executor.execute_layers(&recipe, encrypted_data.encrypted_content.as_slice()).await?;
+        // Execute the recipe to process the encrypted data through all layers
+        let processed_data = self.layer_executor.execute_recipe(encrypted_data.encrypted_content.as_slice(), &recipe).await?;
         
-        // Assemble packet using packet builder
-        let packet = self.packet_builder.build_packet(layers.clone(), packet_type.clone()).await?;
+        // Store the recipe in cache for later extraction
+        self.recipe_cache.insert(recipe.recipe_id, recipe.clone());
+        
+        // Assemble packet using packet builder with processed data
+        let packet = self.packet_builder.build_packet_with_data(processed_data.content, packet_type.clone()).await?;
         
         // Update statistics with packet information
         self.update_statistics(&recipe)?;
         
         tracing::info!("Generated polymorphic packet type {:?} with {} layers, encrypted with white noise", 
-            packet_type, layers.len());
+            packet_type, processed_data.layer_count);
         
         Ok(packet)
     }
@@ -817,6 +820,40 @@ impl PacketBuilder {
         tracing::debug!("Built polymorphic packet {} with {} layers", packet_id, content_size);
         Ok(packet)
     }
+    
+    /// Build final packet with processed data
+    pub async fn build_packet_with_data(
+        &self,
+        processed_data: Vec<u8>,
+        packet_type: PacketType,
+    ) -> Result<PolymorphicPacket> {
+        let packet_id = Uuid::new_v4();
+        let recipe_id = Uuid::new_v4();
+        
+        let packet = PolymorphicPacket {
+            packet_id,
+            recipe_id,
+            encrypted_content: processed_data.clone(),
+            layer_count: 1, // Default layer count, will be updated by caller
+            created_at: SystemTime::now(),
+            packet_type,
+            metadata: PacketMetadata {
+                total_size: processed_data.len(),
+                noise_ratio: 0.5, // Default noise ratio
+                interweaving_pattern: InterweavingPattern::Random,
+                chaos_signature: vec![0u8; 32], // Placeholder
+            },
+        };
+        
+        // Use packet assembler to finalize the packet
+        let final_packet = self.packet_assembler.assemble_packet(packet).await?;
+        
+        // Verify packet integrity
+        self.integrity_checker.verify_packet(&final_packet)?;
+        
+        tracing::debug!("Built polymorphic packet {} with {} bytes of processed data", packet_id, processed_data.len());
+        Ok(final_packet)
+    }
 
     /// Generate chaos signature for packet
     fn generate_chaos_signature(&self, recipe: &LayerInstruction) -> Vec<u8> {
@@ -918,6 +955,12 @@ pub struct PacketMetadata {
 pub struct PacketAssembler;
 impl PacketAssembler {
     pub fn new() -> Self { Self }
+    
+    pub async fn assemble_packet(&self, packet: PolymorphicPacket) -> Result<PolymorphicPacket> {
+        // For now, just return the packet as-is
+        // In a full implementation, this would add headers, checksums, etc.
+        Ok(packet)
+    }
 }
 
 pub struct IntegrityChecker;

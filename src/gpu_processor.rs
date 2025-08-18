@@ -116,6 +116,33 @@ impl GPUTaskScheduler {
         Ok(())
     }
     
+    /// Remove a GPU node from the scheduler
+    pub async fn remove_gpu(&self, node_id: String) -> Result<()> {
+        // Check if GPU has active tasks
+        let has_active_tasks = {
+            let active_tasks = self.active_tasks.read().await;
+            active_tasks.values().any(|task| task.assigned_node.as_ref() == Some(&node_id))
+        };
+        
+        if has_active_tasks {
+            return Err(anyhow::anyhow!("Cannot remove GPU {} while it has active tasks", node_id));
+        }
+        
+        // Remove from available GPUs
+        {
+            let mut gpus = self.available_gpus.write().await;
+            gpus.remove(&node_id);
+        }
+        
+        // Send removal event
+        if let Err(e) = self.scheduler_events.send(SchedulerEvent::GPURemoved(node_id.clone())).await {
+            tracing::warn!("Failed to send GPU removal event: {}", e);
+        }
+        
+        tracing::info!("Removed GPU node {}", node_id);
+        Ok(())
+    }
+    
     /// Submit a GPU processing task
     pub async fn submit_task(&self, task: GPUProcessingTask) -> Result<()> {
         {
@@ -168,6 +195,9 @@ impl GPUTaskScheduler {
                     // Add to active tasks
                     active_tasks.insert(task_id, assigned_task);
                     
+                    // Start processing the task (this will emit TaskCompleted/TaskFailed events)
+                    self.start_task_processing(task_id, node_id.clone()).await?;
+                    
                     // Remove from queue
                     queue.remove(i);
                     
@@ -186,6 +216,51 @@ impl GPUTaskScheduler {
         
         if assigned_count > 0 {
             tracing::info!("Assigned {} GPU tasks to available nodes", assigned_count);
+        }
+        
+        Ok(())
+    }
+    
+    /// Start processing a task on the assigned GPU
+    async fn start_task_processing(&self, task_id: Uuid, node_id: String) -> Result<()> {
+        // Get the task details
+        let task = {
+            let active_tasks = self.active_tasks.read().await;
+            active_tasks.get(&task_id).cloned()
+        };
+        
+        if let Some(task) = task {
+            // Get the GPU capability
+            let gpu_capability = {
+                let gpus = self.available_gpus.read().await;
+                gpus.get(&node_id).cloned()
+            };
+            
+            if let Some(capability) = gpu_capability {
+                // Create a GPU processor for this task
+                let (mut processor, _) = GPUProcessor::new(node_id.clone(), capability).await?;
+                
+                // Process the task in a separate task to avoid blocking
+                let scheduler_events = self.scheduler_events.clone();
+                let task_id_clone = task_id;
+                
+                tokio::spawn(async move {
+                    match processor.process_task(task).await {
+                        Ok(result) => {
+                            // Send task completed event
+                            if let Err(e) = scheduler_events.send(SchedulerEvent::TaskCompleted(task_id_clone, result)).await {
+                                tracing::warn!("Failed to send task completed event: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            // Send task failed event
+                            if let Err(e) = scheduler_events.send(SchedulerEvent::TaskFailed(task_id_clone, e.to_string())).await {
+                                tracing::warn!("Failed to send task failed event: {}", e);
+                            }
+                        }
+                    }
+                });
+            }
         }
         
         Ok(())
@@ -302,15 +377,15 @@ pub enum TaskEvent {
 
 impl GPUProcessor {
     /// Create a new GPU processor
-    pub async fn new(node_id: String, capability: GPUCapability) -> Result<Self> {
-        let (task_events, _) = mpsc::channel(100);
+    pub async fn new(node_id: String, capability: GPUCapability) -> Result<(Self, mpsc::Receiver<TaskEvent>)> {
+        let (task_events, task_events_rx) = mpsc::channel(100);
         
-        Ok(Self {
+        Ok((Self {
             node_id,
             capability,
             current_task: None,
             task_events,
-        })
+        }, task_events_rx))
     }
     
     /// Process a GPU task
@@ -325,7 +400,17 @@ impl GPUProcessor {
         let start_time = SystemTime::now();
         
         // Simulate GPU processing based on task complexity
-        let _processing_time = self.simulate_gpu_processing(&task).await?;
+        let processing_time = self.simulate_gpu_processing(&task).await?;
+        
+        // Send progress updates during processing
+        let progress_interval = processing_time.div_f32(4.0); // 4 progress updates
+        for i in 1..=4 {
+            let progress = i as f32 / 4.0;
+            if let Err(e) = self.task_events.send(TaskEvent::TaskProgress(task.id, progress)).await {
+                tracing::warn!("Failed to send task progress event: {}", e);
+            }
+            tokio::time::sleep(progress_interval).await;
+        }
         
         // Generate result data
         let result_data = self.generate_result_data(&task).await?;

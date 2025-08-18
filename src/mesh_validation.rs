@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, RwLock};
 use std::sync::Arc;
 use uuid::Uuid;
 use sha3::{Keccak256, Digest};
@@ -67,7 +67,7 @@ pub struct MeshValidator {
     pending_transactions: Arc<RwLock<HashMap<Uuid, MeshTransaction>>>,
     validation_results: Arc<RwLock<HashMap<Uuid, Vec<ValidationResult>>>>,
     user_balances: Arc<RwLock<HashMap<String, UserBalance>>>, // Track mesh balances
-    validation_events: mpsc::Sender<ValidationEvent>,
+    validation_events: broadcast::Sender<ValidationEvent>,
     // Contract task tracking
     active_contract_tasks: Arc<RwLock<HashMap<u64, ValidationTask>>>,
     contract_task_signatures: Arc<RwLock<HashMap<u64, HashMap<String, Vec<u8>>>>>, // task_id -> (node_id -> signature)
@@ -142,10 +142,10 @@ impl MeshValidator {
         Ok(true)
     }
     /// Create a new mesh validator
-    pub fn new(node_keys: NodeKeypair, config: RoninConfig) -> Self {
-        let (validation_events, _) = mpsc::channel(100);
+    pub fn new(node_keys: NodeKeypair, config: RoninConfig) -> (Self, broadcast::Receiver<ValidationEvent>) {
+        let (validation_events, validation_events_rx) = broadcast::channel(100);
 
-        Self {
+        let validator = Self {
             node_keys,
             config,
             pending_transactions: Arc::new(RwLock::new(HashMap::new())),
@@ -163,7 +163,9 @@ impl MeshValidator {
                 risk_adjustment: 0.1,
             },
             minimum_signature_threshold: 3, // Require at least 3 valid signatures
-        }
+        };
+        
+        (validator, validation_events_rx)
     }
 
     /// Process a mesh transaction
@@ -177,7 +179,7 @@ impl MeshValidator {
         }
         
         // Send transaction received event
-        if let Err(e) = self.validation_events.send(ValidationEvent::TransactionReceived(transaction_id)).await {
+        if let Err(e) = self.validation_events.send(ValidationEvent::TransactionReceived(transaction_id)) {
             tracing::warn!("Failed to send transaction received event: {}", e);
         }
         
@@ -192,12 +194,12 @@ impl MeshValidator {
             self.update_economic_stats(&transaction).await?;
             
             // Send validation completed event
-            if let Err(e) = self.validation_events.send(ValidationEvent::ValidationCompleted(transaction_id, true)).await {
+            if let Err(e) = self.validation_events.send(ValidationEvent::ValidationCompleted(transaction_id, true)) {
                 tracing::warn!("Failed to send validation completed event: {}", e);
             }
             
             // Send transaction executed event
-            if let Err(e) = self.validation_events.send(ValidationEvent::TransactionExecuted(transaction_id)).await {
+            if let Err(e) = self.validation_events.send(ValidationEvent::TransactionExecuted(transaction_id)) {
                 tracing::warn!("Failed to send transaction executed event: {}", e);
             }
             
@@ -207,7 +209,7 @@ impl MeshValidator {
             self.reject_transaction(transaction_id, validation_result.reason.as_ref().unwrap_or(&"Validation failed".to_string()).clone()).await?;
             
             // Send validation completed event
-            if let Err(e) = self.validation_events.send(ValidationEvent::ValidationCompleted(transaction_id, false)).await {
+            if let Err(e) = self.validation_events.send(ValidationEvent::ValidationCompleted(transaction_id, false)) {
                 tracing::warn!("Failed to send validation completed event: {}", e);
             }
             
@@ -283,10 +285,10 @@ impl MeshValidator {
 
                 if consensus_reached {
                     self.execute_transaction(transaction).await?;
-                    let _ = self.validation_events.send(ValidationEvent::ValidationCompleted(tx_id, true)).await;
+                    let _ = self.validation_events.send(ValidationEvent::ValidationCompleted(tx_id, true));
                 } else {
                     self.reject_transaction(tx_id, "Validation consensus not reached".to_string()).await?;
-                    let _ = self.validation_events.send(ValidationEvent::ValidationCompleted(tx_id, false)).await;
+                    let _ = self.validation_events.send(ValidationEvent::ValidationCompleted(tx_id, false));
                 }
             }
         }
@@ -322,7 +324,7 @@ impl MeshValidator {
             }
         }
 
-        let _ = self.validation_events.send(ValidationEvent::TransactionExecuted(transaction.id)).await;
+        let _ = self.validation_events.send(ValidationEvent::TransactionExecuted(transaction.id));
         Ok(())
     }
 
@@ -393,7 +395,7 @@ impl MeshValidator {
             }
         }
 
-        let _ = self.validation_events.send(ValidationEvent::TransactionRejected(tx_id, reason)).await;
+        let _ = self.validation_events.send(ValidationEvent::TransactionRejected(tx_id, reason));
         Ok(())
     }
 
@@ -465,8 +467,8 @@ impl MeshValidator {
         }
         receiver_balance.last_updated = SystemTime::now();
 
-        let _ = self.validation_events.send(ValidationEvent::BalanceUpdated(transaction.from_address.clone())).await;
-        let _ = self.validation_events.send(ValidationEvent::BalanceUpdated(transaction.to_address.clone())).await;
+        let _ = self.validation_events.send(ValidationEvent::BalanceUpdated(transaction.from_address.clone()));
+        let _ = self.validation_events.send(ValidationEvent::BalanceUpdated(transaction.to_address.clone()));
 
         // Update economic engine with network statistics
         self.update_economic_stats(transaction).await?;
@@ -569,8 +571,8 @@ impl MeshValidator {
                 .insert(node_id.clone(), signature);
         }
 
-        let _ = self.validation_events.send(ValidationEvent::ContractTaskReceived(task.id)).await;
-        let _ = self.validation_events.send(ValidationEvent::ContractTaskSignatureCollected(task.id, node_id)).await;
+        let _ = self.validation_events.send(ValidationEvent::ContractTaskReceived(task.id));
+        let _ = self.validation_events.send(ValidationEvent::ContractTaskSignatureCollected(task.id, node_id));
 
         Ok(())
     }
@@ -624,7 +626,7 @@ impl MeshValidator {
                 .insert(node_id.clone(), signature);
         }
 
-        let _ = self.validation_events.send(ValidationEvent::ContractTaskSignatureCollected(task_id, node_id)).await;
+        let _ = self.validation_events.send(ValidationEvent::ContractTaskSignatureCollected(task_id, node_id));
 
         // Check if we have enough signatures to submit
         self.check_contract_task_completion(task_id).await?;
@@ -657,7 +659,7 @@ impl MeshValidator {
                 tracing::info!("Contract task {} has sufficient signatures ({}/{})",
                     task_id, signature_count, cohort_size);
 
-                let _ = self.validation_events.send(ValidationEvent::ContractTaskCompleted(task_id, true)).await;
+                let _ = self.validation_events.send(ValidationEvent::ContractTaskCompleted(task_id, true));
             }
         }
 
@@ -788,7 +790,7 @@ impl MeshValidator {
         tracing::info!("Contract task result submitted with tx hash: {}", tx_hash);
 
         // Send validation event
-        let _ = self.validation_events.send(ValidationEvent::ContractTaskCompleted(task_id, true)).await;
+        let _ = self.validation_events.send(ValidationEvent::ContractTaskCompleted(task_id, true));
 
         Ok(())
     }

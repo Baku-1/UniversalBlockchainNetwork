@@ -10,6 +10,8 @@ use crate::crypto::NodeKeypair;
 use crate::validator::{ComputationTask, TaskResult};
 use crate::config::MeshConfig;
 use crate::mesh_validation::{MeshValidator, MeshTransaction, ValidationResult};
+use crate::mesh_routing::MeshRouter;
+use crate::mesh_topology::MeshTopology;
 
 
 // Bluetooth Low Energy imports
@@ -80,6 +82,8 @@ pub struct BluetoothMeshManager {
     peers: Arc<RwLock<HashMap<String, MeshPeer>>>,
     message_cache: Arc<RwLock<HashMap<Uuid, std::time::SystemTime>>>, // For loop prevention
     routing_table: Arc<RwLock<HashMap<String, String>>>, // target_id -> next_hop_id
+    mesh_router: Arc<MeshRouter>,
+    mesh_topology: Arc<RwLock<MeshTopology>>,
     to_validator: mpsc::Sender<ComputationTask>,
     from_validator: mpsc::Receiver<TaskResult>,
     mesh_validator: Option<Arc<MeshValidator>>,
@@ -181,6 +185,13 @@ impl BluetoothMeshManager {
             tracing::warn!("No Bluetooth adapter found, mesh networking will be limited");
         }
 
+        // Initialize mesh topology and router
+        let mesh_topology = Arc::new(RwLock::new(MeshTopology::new(node_keys.node_id())));
+        let mesh_router = Arc::new(MeshRouter::new(
+            node_keys.node_id(),
+            Arc::clone(&mesh_topology),
+        ));
+
         Ok(Self {
             config,
             node_keys,
@@ -188,6 +199,8 @@ impl BluetoothMeshManager {
             peers: Arc::new(RwLock::new(HashMap::new())),
             message_cache: Arc::new(RwLock::new(HashMap::new())),
             routing_table: Arc::new(RwLock::new(HashMap::new())),
+            mesh_router,
+            mesh_topology,
             to_validator,
             from_validator,
             mesh_validator: None,
@@ -367,10 +380,29 @@ impl BluetoothMeshManager {
 
     /// Update routing table based on current network topology
     pub async fn update_routing_table(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // TODO: Implement routing table update logic
-        // This would use a routing algorithm like AODV or DSR
-        tracing::debug!("Updating mesh routing table");
+        // Use the mesh topology to update routing table - integrating unconnected logic
+        let mut topology = self.mesh_topology.write().await;
+        topology.rebuild_routing_table();
+        
+        // Get all nodes and build routing table
+        let nodes = topology.get_all_nodes();
+        let mut routing_table = self.routing_table.write().await;
+        routing_table.clear();
+        
+        for node_info in nodes {
+            if let Some(next_hop) = topology.get_next_hop(&node_info.node_id) {
+                routing_table.insert(node_info.node_id.clone(), next_hop.clone());
+            }
+        }
+        
+        tracing::info!("Updated routing table with {} routes using mesh topology", routing_table.len());
         Ok(())
+    }
+    
+    /// Get routing statistics from the mesh router
+    pub async fn get_routing_stats(&self) -> crate::mesh_routing::RoutingStats {
+        // Access the mesh router's routing statistics
+        self.mesh_router.get_routing_stats().await
     }
 
     // Private helper methods
@@ -471,6 +503,22 @@ impl BluetoothMeshManager {
                     if let Ok(validation_result) = bincode::deserialize::<ValidationResult>(&message.payload) {
                         // Process validation result (this would be implemented)
                         tracing::debug!("Received validation result: {:?}", validation_result);
+                    }
+                }
+            }
+            MeshMessageType::RouteDiscovery => {
+                // Use the mesh router to handle route discovery - integrating unconnected logic
+                if let Ok(discovery_message) = bincode::deserialize::<crate::mesh_routing::RouteDiscoveryMessage>(&message.payload) {
+                    let send_callback = |mesh_msg: MeshMessage, target: String| -> Result<(), Box<dyn std::error::Error>> {
+                        // This would send the message to the target peer
+                        tracing::debug!("Route discovery callback: sending message {} to {}", mesh_msg.id, target);
+                        Ok(())
+                    };
+                    
+                    if let Err(e) = self.mesh_router.process_route_discovery(discovery_message, send_callback).await {
+                        tracing::warn!("Failed to process route discovery: {}", e);
+                    } else {
+                        tracing::debug!("Successfully processed route discovery message");
                     }
                 }
             }

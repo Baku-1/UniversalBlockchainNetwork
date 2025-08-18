@@ -1,7 +1,7 @@
 // src/secure_execution.rs
 
 use std::collections::HashMap;
-use sha3::{Keccak256, Digest};
+use sha3::Digest;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tracing;

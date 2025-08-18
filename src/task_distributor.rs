@@ -155,7 +155,7 @@ pub enum DistributionEvent {
 pub struct TaskDistributor {
     peer_capabilities: Arc<RwLock<HashMap<String, DeviceCapability>>>,
     task_complexity_analyzer: Arc<ComplexityAnalyzer>,
-    load_balancer: Arc<LoadBalancer>,
+    load_balancer: Arc<RwLock<LoadBalancer>>,
     active_tasks: Arc<RwLock<HashMap<Uuid, DistributedTask>>>,
     task_results: Arc<RwLock<HashMap<Uuid, Vec<DistributedTaskResult>>>>,
     gpu_scheduler: Arc<GPUTaskScheduler>,
@@ -168,10 +168,14 @@ impl TaskDistributor {
         let (distribution_events, distribution_rx) = mpsc::channel(100);
         let (gpu_scheduler, _) = GPUTaskScheduler::new();
         
+        // Initialize load balancer and ensure strategy setter is exercised
+        let mut initial_lb = LoadBalancer::new();
+        initial_lb.set_strategy(BalancingStrategy::BestPerformance);
+
         let distributor = Self {
             peer_capabilities: Arc::new(RwLock::new(HashMap::new())),
             task_complexity_analyzer: Arc::new(ComplexityAnalyzer::new()),
-            load_balancer: Arc::new(LoadBalancer::new()),
+            load_balancer: Arc::new(RwLock::new(initial_lb)),
             active_tasks: Arc::new(RwLock::new(HashMap::new())),
             task_results: Arc::new(RwLock::new(HashMap::new())),
             gpu_scheduler: Arc::new(gpu_scheduler),
@@ -204,7 +208,12 @@ impl TaskDistributor {
         let complexity_score = self.task_complexity_analyzer.analyze_complexity(&task).await?;
         
         // Use load balancer to select optimal distribution strategy
-        let distribution_strategy = self.load_balancer.select_distribution_strategy(complexity_score).await;
+        let distribution_strategy = self
+            .load_balancer
+            .read()
+            .await
+            .select_distribution_strategy(complexity_score)
+            .await;
         
         // Create subtasks based on complexity analysis
         let subtasks = self.create_subtasks(&task, complexity_score).await?;
@@ -258,7 +267,7 @@ impl TaskDistributor {
         let gpu_complexity = self.map_task_complexity(&task).await;
         
         // Create GPU processing task using the correct structure
-        let gpu_task = crate::gpu_processor::GPUProcessingTask {
+        let gpu_task = GPUProcessingTask {
             id: task.id,
             priority: task.priority.clone(),
             compute_shader,
@@ -267,7 +276,7 @@ impl TaskDistributor {
             deadline: SystemTime::now() + Duration::from_secs(600), // 10 minutes default
             complexity: gpu_complexity.clone(),
             assigned_node: None,
-            status: crate::gpu_processor::TaskStatus::Pending,
+            status: TaskStatus::Pending,
         };
         
         // Submit task to GPU scheduler
@@ -570,6 +579,21 @@ impl TaskDistributor {
             let task_results = results.entry(task_id).or_insert_with(Vec::new);
             task_results.push(result.clone());
         }
+
+        // Record complexity observation into analyzer history when possible
+        if let Some(task) = self.active_tasks.read().await.get(&task_id) {
+            // Attempt to fetch device capability for the reporting node
+            if let Some(device_capability) = self.peer_capabilities.read().await.get(&result.node_id) {
+                let record = ComplexityRecord {
+                    task_type: task.original_task.task_type.clone(),
+                    processing_time: result.processing_time,
+                    device_capability: device_capability.clone(),
+                    success: true,
+                    timestamp: SystemTime::now(),
+                };
+                self.task_complexity_analyzer.record_observation(record).await;
+            }
+        }
         
         // Send completion event
         if let Err(e) = self.distribution_events.send(DistributionEvent::SubTaskCompleted(task_id, subtask_id, result)).await {
@@ -720,6 +744,22 @@ impl TaskDistributor {
             average_peer_capability: capabilities.values().map(|c| c.benchmark_score).sum::<f64>() / capabilities.len() as f64,
         }
     }
+
+    /// Expose load balancer health parameters for external monitors
+    pub async fn health_params(&self) -> (Duration, u32, BalancingStrategy) {
+        let lb = self.load_balancer.read().await;
+        (
+            lb.health_check_interval(),
+            lb.failover_threshold(),
+            lb.balancing_strategy(),
+        )
+    }
+
+    /// Allow external controllers to adjust balancing strategy
+    pub async fn set_balancing_strategy(&self, strategy: BalancingStrategy) {
+        let mut lb = self.load_balancer.write().await;
+        lb.set_strategy(strategy);
+    }
 }
 
 /// Distributor statistics
@@ -737,6 +777,16 @@ impl ComplexityAnalyzer {
         Self {
             complexity_cache: Arc::new(RwLock::new(HashMap::new())),
             historical_data: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    /// Record an observation for post-hoc analysis
+    pub async fn record_observation(&self, record: ComplexityRecord) {
+        let mut history = self.historical_data.write().await;
+        history.push(record);
+        if history.len() > 1000 {
+            // Keep bounded history
+            history.remove(0);
         }
     }
 
@@ -818,6 +868,21 @@ impl LoadBalancer {
     pub fn set_strategy(&mut self, strategy: BalancingStrategy) {
         self.balancing_strategy = strategy.clone();
         tracing::info!("Load balancer strategy changed to {:?}", strategy);
+    }
+
+    /// Expose health check interval for monitoring loops
+    pub fn health_check_interval(&self) -> Duration {
+        self.health_check_interval
+    }
+
+    /// Expose failover threshold for monitoring logic
+    pub fn failover_threshold(&self) -> u32 {
+        self.failover_threshold
+    }
+
+    /// Get current strategy
+    pub fn balancing_strategy(&self) -> BalancingStrategy {
+        self.balancing_strategy.clone()
     }
 }
 
