@@ -7,6 +7,7 @@ pub mod ipc;
 pub mod p2p;
 pub mod validator;
 pub mod errors;
+pub mod shared_types;
 
 // NEW MODULES FOR FINAL 5% IMPLEMENTATION
 pub mod economic_engine;

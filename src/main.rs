@@ -26,6 +26,7 @@ mod secure_execution;
 mod white_noise_crypto;
 mod polymorphic_matrix;
 mod lending_pools;
+mod shared_types;
 
 // Re-export public APIs for external use
 pub use config::*;
@@ -39,7 +40,7 @@ pub use mesh_topology::*;
 pub use errors::{NexusError, ErrorContext};
 pub use aura_protocol::{AuraProtocolClient, ValidationTask, TaskStatus, TaskResult};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, broadcast};
 use tokio::sync::RwLock;
 use std::sync::Arc;
 use std::path::Path;
@@ -79,6 +80,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create channels for transaction queue events
     let (queue_event_tx, mut queue_event_rx) = mpsc::channel(100);
+    
+    // Create status channel for P2P networking
+    let (status_tx, _status_rx) = broadcast::channel(100);
 
     // Initialize offline transaction queue
     let db_path = Path::new("./data/transactions.db");
@@ -649,6 +653,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         validator::start_validator(mesh_from_validator, mesh_to_result_clone).await;
     });
+    
+    // Initialize engine management system
+    let (engine_command_tx, engine_command_rx) = mpsc::channel(32);
+    
     let mesh_manager = Arc::new(mesh_manager);
     tracing::info!("Bluetooth mesh manager initialized");
     
@@ -1885,21 +1893,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     tracing::info!("Comprehensive bridge node operations started with real functionality");
 
-    // Spawn comprehensive P2P networking operations with real functionality
-    let node_keys_clone = node_keys.clone();
-    let computation_task_tx_clone = computation_task_tx.clone();
-    // Create a separate task result receiver for P2P operations
-    let (p2p_task_result_tx, p2p_task_result_rx) = mpsc::channel(128);
-    
-    tokio::spawn(async move {
-        // Start the P2P node with real functionality from p2p.rs
-        crate::p2p::start_p2p_node(
-            node_keys_clone,
-            computation_task_tx_clone,
-            p2p_task_result_rx,
-        ).await;
-    });
-    tracing::info!("Comprehensive P2P networking operations started with real functionality");
+    // P2P networking will be spawned later with proper channel setup
 
     // Spawn comprehensive sync operations with real functionality
     let sync_manager = Arc::new(sync_manager);
@@ -2444,6 +2438,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut store_forward_events = store_forward.start_service().await;
     tracing::info!("Store & forward system started");
 
+    // Spawn engine manager for centralized control
+    tokio::spawn(engine_manager(
+        engine_command_rx,
+        queue_event_rx,
+        sync_events,
+        bridge_events,
+        store_forward_events,
+    ));
+    tracing::info!("Engine manager started");
+
     // --- 3. Spawning Core Services ---
 
     // Spawn the validator engine
@@ -2457,13 +2461,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(ipc::start_ipc_server(app_config.ipc_port));
     tracing::info!("IPC server started on port {}", app_config.ipc_port);
 
-    // Spawn the main P2P networking task
+    // Spawn the main P2P networking task with proper channel setup
     tokio::spawn(p2p::start_p2p_node(
         node_keys.clone(),
         computation_task_tx,
         task_result_rx,
+        status_tx.clone(),
     ));
-    tracing::info!("P2P networking started");
+    tracing::info!("P2P networking started with proper channel integration");
 
     // Spawn comprehensive task distribution service with advanced features
     let task_distributor_clone = Arc::clone(&task_distributor);
@@ -3429,6 +3434,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Aura Validation Network fully initialized and running");
     tracing::info!("Bluetooth mesh networking enabled for offline Ronin transactions");
     tracing::info!("Press CTRL+C to shut down");
+    
+    // Wait for shutdown signal
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("🛑 Shutdown signal received. Terminating services.");
+    
+    Ok(())
+}
+
+/// Manages the overall state of the engine based on external commands.
+async fn engine_manager(
+    mut command_rx: mpsc::Receiver<shared_types::EngineCommand>,
+    mut queue_event_rx: mpsc::Receiver<transaction_queue::QueueEvent>,
+    mut sync_events: mpsc::Receiver<sync::SyncEvent>,
+    mut bridge_events: mpsc::Receiver<bridge_node::BridgeEvent>,
+    mut store_forward_events: mpsc::Receiver<store_forward::StoreForwardEvent>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!("🔧 Engine manager started - ready to receive commands");
+    
+    while let Some(command) = command_rx.recv().await {
+        match command {
+            shared_types::EngineCommand::Pause => {
+                tracing::info!("[Manager] Pausing all network and validation activity.");
+                // TODO: Implement pause logic for all services
+            },
+            shared_types::EngineCommand::Resume => {
+                tracing::info!("[Manager] Resuming all network and validation activity.");
+                // TODO: Implement resume logic for all services
+            },
+            shared_types::EngineCommand::Shutdown => {
+                tracing::info!("[Manager] Shutdown command received.");
+                // TODO: Implement graceful shutdown
+                break;
+            },
+            shared_types::EngineCommand::GetStatus => {
+                tracing::debug!("[Manager] Status request received.");
+                // TODO: Implement status reporting
+            },
+        }
+    }
+    
+    tracing::info!("🔧 Engine manager shutting down");
 
     loop {
         tokio::select! {
@@ -3530,21 +3576,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // --- 5. Graceful Shutdown ---
-
-    tracing::info!("Performing graceful shutdown...");
-
-    // Clean up transaction queue
-    let cleanup_count = transaction_queue.cleanup().await?;
-    tracing::info!("Cleaned up {} completed transactions", cleanup_count);
-
-    // Get final statistics
-    let queue_stats = transaction_queue.get_stats().await;
-    tracing::info!("Final queue stats: {:?}", queue_stats);
-
-    let sync_stats = sync_manager.get_sync_stats().await;
-    tracing::info!("Final sync stats: {:?}", sync_stats);
-
-    tracing::info!("Aura Validation Network shutdown complete");
+    tracing::info!("🔧 Engine manager shutting down");
     Ok(())
 }

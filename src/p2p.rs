@@ -1,9 +1,11 @@
 // src/p2p.rs
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, broadcast};
 use crate::crypto::NodeKeypair;
 use crate::validator::{ComputationTask, TaskResult};
 use crate::mesh;
+use crate::ipc::EngineStatus;
+use serde_json;
 use libp2p::{
     gossipsub, mdns, noise, tcp, yamux, swarm::NetworkBehaviour, swarm::SwarmEvent,
     PeerId, identity::Keypair as Libp2pKeypair
@@ -25,6 +27,7 @@ pub async fn start_p2p_node(
     node_keys: NodeKeypair,
     to_validator: mpsc::Sender<ComputationTask>,
     from_validator: mpsc::Receiver<TaskResult>,
+    status_tx: broadcast::Sender<EngineStatus>,
 ) {
     // 1. **Check for a stable internet connection.**
     let have_internet = check_internet_connection().await;
@@ -32,7 +35,7 @@ pub async fn start_p2p_node(
     // 2. **Launch the appropriate mode.**
     if have_internet {
         tracing::info!("Internet connection detected. Starting in WAN mode.");
-        if let Err(e) = run_wan_mode(node_keys, to_validator, from_validator).await {
+        if let Err(e) = run_wan_mode(node_keys, to_validator, from_validator, status_tx).await {
             tracing::error!("WAN mode failed: {}", e);
         }
     } else {
@@ -62,8 +65,9 @@ async fn check_internet_connection() -> bool {
 /// Runs the WAN mode using libp2p for local network discovery
 async fn run_wan_mode(
     node_keys: NodeKeypair,
-    _to_validator: mpsc::Sender<ComputationTask>,
-    _from_validator: mpsc::Receiver<TaskResult>,
+    to_validator: mpsc::Sender<ComputationTask>,
+    mut from_validator: mpsc::Receiver<TaskResult>,
+    status_tx: broadcast::Sender<EngineStatus>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting WAN mode with libp2p and mDNS discovery");
 
@@ -120,97 +124,148 @@ async fn run_wan_mode(
     tracing::info!("P2P Discovery mode active");
 
     // Main event loop
+    let mut validated_blocks_count: u64 = 0;
     loop {
-        match swarm.select_next_some().await {
-            SwarmEvent::NewListenAddr { address, .. } => {
-                tracing::info!("Listening on: {}", address);
-            }
-            SwarmEvent::Behaviour(event) => {
+        tokio::select! {
+            event = swarm.select_next_some() => {
                 match event {
-                    AuraBehaviourEvent::Mdns(mdns::Event::Discovered(list)) => {
-                        for (peer_id, multiaddr) in list {
-                            tracing::info!("Discovered peer: {} at {}", peer_id, multiaddr);
-
-                            // Update IPC status with discovered peer
-                            crate::ipc::update_engine_status(|status| {
-                                status.total_peers += 1;
-
-                                // Add peer to the mesh peers list for visualization
-                                let peer_info = crate::ipc::MeshPeerInfo {
-                                    id: peer_id.to_string(),
-                                    is_connected: false, // Will be true when connection is established
-                                    connection_quality: 0.95,
-                                    last_seen: chrono::Utc::now().to_rfc3339(),
-                                };
-                                status.mesh_peers.push(peer_info);
-                            }).await;
-
-                            // Dial the discovered peer
-                            if let Err(e) = swarm.dial(multiaddr) {
-                                tracing::warn!("Failed to dial peer {}: {}", peer_id, e);
-                            }
-                        }
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        tracing::info!("Listening on: {}", address);
                     }
-                    AuraBehaviourEvent::Mdns(mdns::Event::Expired(list)) => {
-                        for (peer_id, _) in list {
-                            tracing::info!("Peer expired: {}", peer_id);
+                    SwarmEvent::Behaviour(event) => {
+                        match event {
+                            AuraBehaviourEvent::Mdns(mdns::Event::Discovered(list)) => {
+                                for (peer_id, multiaddr) in list {
+                                    tracing::info!("Discovered peer: {} at {}", peer_id, multiaddr);
 
-                            // Update IPC status
-                            crate::ipc::update_engine_status(|status| {
-                                if status.connected_peers > 0 {
-                                    status.connected_peers -= 1;
+                                    // Update IPC status with discovered peer
+                                    crate::ipc::update_engine_status(|status| {
+                                        status.total_peers += 1;
+
+                                        // Add peer to the mesh peers list for visualization
+                                        let peer_info = crate::ipc::MeshPeerInfo {
+                                            id: peer_id.to_string(),
+                                            is_connected: false, // Will be true when connection is established
+                                            connection_quality: 0.95,
+                                            last_seen: chrono::Utc::now().to_rfc3339(),
+                                        };
+                                        status.mesh_peers.push(peer_info);
+                                    }).await;
+
+                                    // Dial the discovered peer
+                                    if let Err(e) = swarm.dial(multiaddr) {
+                                        tracing::warn!("Failed to dial peer {}: {}", peer_id, e);
+                                    }
                                 }
-                                // Remove peer from mesh peers list
-                                status.mesh_peers.retain(|p| p.id != peer_id.to_string());
-                            }).await;
+                            }
+                            AuraBehaviourEvent::Mdns(mdns::Event::Expired(list)) => {
+                                for (peer_id, _) in list {
+                                    tracing::info!("Peer expired: {}", peer_id);
+
+                                    // Update IPC status
+                                    crate::ipc::update_engine_status(|status| {
+                                        if status.connected_peers > 0 {
+                                            status.connected_peers -= 1;
+                                        }
+                                        // Remove peer from mesh peers list
+                                        status.mesh_peers.retain(|p| p.id != peer_id.to_string());
+                                    }).await;
+                                }
+                            }
+                            AuraBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                                propagation_source: peer_id,
+                                message_id: _,
+                                message,
+                            }) => {
+                                // Try to interpret message as a task or a result
+                                if let Ok(task) = serde_json::from_slice::<ComputationTask>(&message.data) {
+                                    tracing::info!("Received task from {} via gossipsub: {}", peer_id, task.id);
+                                    if let Err(e) = to_validator.send(task).await {
+                                        tracing::warn!("Failed to forward task to validator: {}", e);
+                                    }
+                                } else if let Ok(result) = serde_json::from_slice::<TaskResult>(&message.data) {
+                                    tracing::info!("Received task result from {} via gossipsub: {}", peer_id, result.task_id);
+                                    validated_blocks_count = validated_blocks_count.saturating_add(1);
+                                } else {
+                                    tracing::info!(
+                                        "Received message from {}: {}",
+                                        peer_id,
+                                        String::from_utf8_lossy(&message.data)
+                                    );
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                    AuraBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                        propagation_source: peer_id,
-                        message_id: _,
-                        message,
-                    }) => {
-                        tracing::info!(
-                            "Received message from {}: {}",
-                            peer_id,
-                            String::from_utf8_lossy(&message.data)
-                        );
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        tracing::info!("Connection established with: {}", peer_id);
+
+                        // Update IPC status with successful connection
+                        crate::ipc::update_engine_status(|status| {
+                            status.connected_peers += 1;
+
+                            // Update the peer's connection status
+                            if let Some(peer) = status.mesh_peers.iter_mut().find(|p| p.id == peer_id.to_string()) {
+                                peer.is_connected = true;
+                                peer.last_seen = chrono::Utc::now().to_rfc3339();
+                            }
+                        }).await;
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                        tracing::info!("Connection closed with: {}", peer_id);
+
+                        // Update IPC status
+                        crate::ipc::update_engine_status(|status| {
+                            if status.connected_peers > 0 {
+                                status.connected_peers -= 1;
+                            }
+
+                            // Update the peer's connection status
+                            if let Some(peer) = status.mesh_peers.iter_mut().find(|p| p.id == peer_id.to_string()) {
+                                peer.is_connected = false;
+                                peer.last_seen = chrono::Utc::now().to_rfc3339();
+                            }
+                        }).await;
                     }
                     _ => {}
                 }
-            }
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                tracing::info!("Connection established with: {}", peer_id);
-
-                // Update IPC status with successful connection
-                crate::ipc::update_engine_status(|status| {
-                    status.connected_peers += 1;
-
-                    // Update the peer's connection status
-                    if let Some(peer) = status.mesh_peers.iter_mut().find(|p| p.id == peer_id.to_string()) {
-                        peer.is_connected = true;
-                        peer.last_seen = chrono::Utc::now().to_rfc3339();
+            },
+            Some(result) = from_validator.recv() => {
+                // Publish our own validated result to the network
+                if let Ok(result_json) = serde_json::to_vec(&result) {
+                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), result_json) {
+                        tracing::warn!("Failed to publish result: {}", e);
+                    } else {
+                        validated_blocks_count = validated_blocks_count.saturating_add(1);
                     }
-                }).await;
+                }
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                tracing::info!("Connection closed with: {}", peer_id);
-
-                // Update IPC status
-                crate::ipc::update_engine_status(|status| {
-                    if status.connected_peers > 0 {
-                        status.connected_peers -= 1;
-                    }
-
-                    // Update the peer's connection status
-                    if let Some(peer) = status.mesh_peers.iter_mut().find(|p| p.id == peer_id.to_string()) {
-                        peer.is_connected = false;
-                        peer.last_seen = chrono::Utc::now().to_rfc3339();
-                    }
-                }).await;
-            }
-            _ => {}
         }
+
+        // After handling either path, broadcast current status
+        let status = EngineStatus {
+            is_connected: true,
+            is_running: true,
+            mode: "WAN".to_string(),
+            mesh_mode: false,
+            node_id: "p2p_node".to_string(),
+            mesh_peers: Vec::new(),
+            total_peers: swarm.network_info().num_peers(),
+            connected_peers: swarm.network_info().num_peers(),
+            validation_session: None,
+            web3_users: Vec::new(),
+            total_users: 0,
+            ronin_connected: false,
+            ronin_block_number: None,
+            ronin_gas_price: None,
+            transaction_queue: 0,
+            pending_transactions: 0,
+            last_sync_time: None,
+            last_task: "P2P Discovery".to_string(),
+            tasks_processed: validated_blocks_count as u64,
+            validation_rate: 0.0,
+        };
+        let _ = status_tx.send(status);
     }
 }
 
