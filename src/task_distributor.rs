@@ -605,7 +605,50 @@ impl TaskDistributor {
         
         Ok(())
     }
-    
+
+    /// Record subtask failure
+    pub async fn record_subtask_failure(&self, task_id: Uuid, subtask_id: Uuid, error_message: String) -> Result<()> {
+        // Update subtask status in active tasks
+        {
+            let mut active_tasks = self.active_tasks.write().await;
+            if let Some(task) = active_tasks.get_mut(&task_id) {
+                for subtask in &mut task.subtasks {
+                    if subtask.id == subtask_id {
+                        subtask.status = SubTaskStatus::Failed(error_message.clone());
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Send failure event (eliminates SubTaskFailed warning)
+        if let Err(e) = self.distribution_events.send(DistributionEvent::SubTaskFailed(task_id, subtask_id, error_message.clone())).await {
+            tracing::warn!("Failed to send subtask failure event: {}", e);
+        }
+
+        // Check if task should be marked as failed or if retry is possible
+        self.check_task_failure(task_id).await?;
+
+        Ok(())
+    }
+
+    /// Check if a distributed task should be marked as failed
+    async fn check_task_failure(&self, task_id: Uuid) -> Result<()> {
+        let mut active_tasks = self.active_tasks.write().await;
+        if let Some(task) = active_tasks.get_mut(&task_id) {
+            let failed_count = task.subtasks.iter()
+                .filter(|st| matches!(st.status, SubTaskStatus::Failed(_)))
+                .count();
+
+            // If more than 50% of subtasks failed, mark the entire task as failed
+            if failed_count > task.subtasks.len() / 2 {
+                task.status = DistributionStatus::Failed(format!("{} out of {} subtasks failed", failed_count, task.subtasks.len()));
+                tracing::warn!("Task {} marked as failed due to excessive subtask failures", task_id);
+            }
+        }
+        Ok(())
+    }
+
     /// Check if a distributed task is complete
     async fn check_task_completion(&self, task_id: Uuid) -> Result<()> {
         let active_tasks = self.active_tasks.read().await;

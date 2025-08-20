@@ -178,75 +178,9 @@ impl Default for EngineStatus {
 static ENGINE_STATUS: once_cell::sync::Lazy<Arc<RwLock<EngineStatus>>> =
     once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(EngineStatus::default())));
 
-pub async fn start_ipc_server(port: u16) {
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = TcpListener::bind(&addr).await.expect("Failed to bind IPC server");
-    tracing::info!("Enhanced IPC Server listening on: ws://{}", addr);
+// Old basic IPC server removed - replaced by enhanced version below
 
-    while let Ok((stream, _)) = listener.accept().await {
-        tokio::spawn(handle_connection(stream));
-    }
-}
-
-async fn handle_connection(stream: TcpStream) {
-    if let Ok(websocket) = accept_async(stream).await {
-        tracing::info!("Web Portal connected to Nexus Engine.");
-        let (mut ws_sender, mut ws_receiver) = websocket.split();
-
-        // Send initial status
-        let status = ENGINE_STATUS.read().await.clone();
-        let initial_message = json!({
-            "type": "status",
-            "data": status
-        });
-
-        if let Err(e) = ws_sender.send(Message::Text(initial_message.to_string())).await {
-            tracing::error!("Failed to send initial status: {}", e);
-            return;
-        }
-
-        // Handle incoming messages
-        while let Some(msg_result) = ws_receiver.next().await {
-            match msg_result {
-                Ok(Message::Text(text)) => {
-                    tracing::debug!("Received from web portal: {}", text);
-
-                    let response = if let Ok(command) = serde_json::from_str::<serde_json::Value>(&text) {
-                        handle_command(command).await
-                    } else {
-                        // Handle simple text commands
-                        match text.as_str() {
-                            "status" => {
-                                let status = ENGINE_STATUS.read().await.clone();
-                                json!({
-                                    "type": "status",
-                                    "data": status
-                                }).to_string()
-                            }
-                            _ => json!({"type": "error", "message": "unknown_command"}).to_string(),
-                        }
-                    };
-
-                    if let Err(e) = ws_sender.send(Message::Text(response)).await {
-                        tracing::error!("Failed to send response: {}", e);
-                        break;
-                    }
-                }
-                Ok(Message::Close(_)) => {
-                    tracing::info!("WebSocket connection closed by client");
-                    break;
-                }
-                Err(e) => {
-                    tracing::error!("WebSocket error: {}", e);
-                    break;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    tracing::info!("WebSocket connection ended");
-}
+// Old basic handle_connection removed - replaced by enhanced version below
 
 async fn handle_command(command: serde_json::Value) -> String {
     let cmd = command.get("command").and_then(|c| c.as_str()).unwrap_or("unknown");
@@ -643,8 +577,8 @@ impl IpcServer {
     }
 }
 
-/// Enhanced command handler with better error handling
-async fn handle_command_enhanced(command: &str, _params: Option<serde_json::Value>) -> IpcMessage {
+/// Command handler with comprehensive functionality
+async fn handle_command_enhanced(command: &str, params: Option<serde_json::Value>) -> IpcMessage {
     match command {
         "ping" => {
             let timestamp = std::time::SystemTime::now()
@@ -685,16 +619,47 @@ async fn handle_command_enhanced(command: &str, _params: Option<serde_json::Valu
             }
         }
         _ => {
-            IpcMessage::Error {
-                message: format!("Unknown command: {}", command),
-                code: Some(404),
+            // For all other commands, use the comprehensive handler and convert response
+            let command_json = if let Some(params) = params {
+                json!({
+                    "command": command,
+                    "params": params
+                })
+            } else {
+                json!({
+                    "command": command
+                })
+            };
+
+            let response_string = handle_command(command_json).await;
+
+            // Convert string response to IpcMessage
+            if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_string) {
+                if response_json.get("type") == Some(&json!("command_response")) {
+                    IpcMessage::CommandResponse {
+                        success: response_json.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+                        message: response_json.get("message").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        data: response_json.get("data").cloned(),
+                    }
+                } else {
+                    IpcMessage::CommandResponse {
+                        success: true,
+                        message: Some("Command processed".to_string()),
+                        data: Some(response_json),
+                    }
+                }
+            } else {
+                IpcMessage::Error {
+                    message: format!("Failed to process command: {}", command),
+                    code: Some(500),
+                }
             }
         }
     }
 }
 
-/// Start IPC server with enhanced ping/pong functionality
-pub async fn start_enhanced_ipc_server(port: u16) -> Result<mpsc::Receiver<EnhancedIpcEvent>> {
+/// Start IPC server with ping/pong functionality and event processing
+pub async fn start_ipc_server(port: u16) -> Result<mpsc::Receiver<EnhancedIpcEvent>> {
     let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr).await?;
     let server = Arc::new(IpcServer::new());
@@ -712,7 +677,7 @@ pub async fn start_enhanced_ipc_server(port: u16) -> Result<mpsc::Receiver<Enhan
             let event_tx = event_tx_clone.clone();
             
             tokio::spawn(async move {
-                if let Err(e) = handle_enhanced_connection(stream, server_clone, event_tx).await {
+                if let Err(e) = handle_connection(stream, server_clone, event_tx).await {
                     tracing::error!("Error handling connection from {}: {}", addr, e);
                 }
             });
@@ -722,8 +687,8 @@ pub async fn start_enhanced_ipc_server(port: u16) -> Result<mpsc::Receiver<Enhan
     Ok(event_rx)
 }
 
-/// Handle enhanced WebSocket connection with ping/pong
-async fn handle_enhanced_connection(stream: TcpStream, server: Arc<IpcServer>, event_tx: mpsc::Sender<EnhancedIpcEvent>) -> Result<()> {
+/// Handle WebSocket connection with ping/pong and client tracking
+async fn handle_connection(stream: TcpStream, server: Arc<IpcServer>, event_tx: mpsc::Sender<EnhancedIpcEvent>) -> Result<()> {
     let websocket = accept_async(stream).await?;
     let (mut ws_sender, mut ws_receiver) = websocket.split();
 

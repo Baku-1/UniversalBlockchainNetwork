@@ -29,11 +29,11 @@ pub struct NodeInfo {
 }
 
 #[derive(Debug, Clone)]
-struct CachedRoute {
-    path: Vec<String>,
-    cost: u32,
-    created_at: SystemTime,
-    ttl: Duration,
+pub struct CachedRoute {
+    pub path: Vec<String>,
+    pub cost: u32,
+    pub created_at: SystemTime,
+    pub ttl: Duration,
 }
 
 /// Route discovery message
@@ -331,6 +331,45 @@ impl MeshTopology {
             routing_table_size: self.routing_table.len(),
         }
     }
+
+    /// Get the best route to a destination considering cost
+    pub fn get_best_route(&self, destination: &str) -> Option<&CachedRoute> {
+        self.route_cache.get(destination)
+    }
+
+    /// Get route statistics including cost analysis
+    pub fn get_route_statistics(&self) -> RouteStatistics {
+        let mut total_cost = 0u32;
+        let mut route_count = 0usize;
+        let mut cost_distribution = HashMap::new();
+        
+        for route in self.route_cache.values() {
+            total_cost += route.cost;
+            route_count += 1;
+            
+            // Group routes by cost ranges
+            let cost_range = match route.cost {
+                0..=10 => "low",
+                11..=50 => "medium",
+                51..=100 => "high",
+                _ => "very_high",
+            };
+            
+            *cost_distribution.entry(cost_range.to_string()).or_insert(0) += 1;
+        }
+        
+        let average_cost = if route_count > 0 {
+            total_cost as f64 / route_count as f64
+        } else {
+            0.0
+        };
+        
+        RouteStatistics {
+            total_routes: route_count,
+            average_cost,
+            cost_distribution,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -340,4 +379,11 @@ pub struct NetworkStats {
     pub total_connections: usize,
     pub average_hop_count: f32,
     pub routing_table_size: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteStatistics {
+    pub total_routes: usize,
+    pub average_cost: f64,
+    pub cost_distribution: HashMap<String, usize>,
 }

@@ -306,6 +306,34 @@ impl RoninClient {
         }
     }
 
+    /// Get access to the cross-chain token registry
+    pub fn get_token_registry(&self) -> &Arc<CrossChainTokenRegistry> {
+        &self.token_registry
+    }
+
+    /// Check if a token is supported on the current chain by checking token mappings
+    pub async fn is_token_supported(&self, token_symbol: &str) -> Result<bool, String> {
+        let registry = self.get_token_registry();
+        let mappings = registry.token_mappings.read().await;
+        
+        // Check if any mapping contains this token symbol
+        let is_supported = mappings.iter().any(|((_, symbol), _)| symbol == token_symbol);
+        Ok(is_supported)
+    }
+
+    /// Get supported networks for a specific token
+    pub async fn get_supported_networks(&self, token_symbol: &str) -> Result<Vec<String>, String> {
+        let registry = self.get_token_registry();
+        let networks = registry.get_supported_networks(token_symbol).await;
+        
+        // Convert BlockchainNetwork to String representation
+        let network_strings: Vec<String> = networks.iter()
+            .map(|network| format!("{:?}", network))
+            .collect();
+        
+        Ok(network_strings)
+    }
+
     /// Get network information for developer utility
     pub async fn get_network_info(&self) -> Result<NetworkInfo, String> {
         if !self.check_connectivity().await {

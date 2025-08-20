@@ -320,6 +320,16 @@ impl PolymorphicMatrix {
         &self.statistics
     }
 
+    /// Get access to the recipe generator for seed management
+    pub fn get_recipe_generator(&self) -> &RecipeGenerator {
+        &self.recipe_generator
+    }
+
+    /// Get mutable access to the recipe generator for reseeding
+    pub fn get_recipe_generator_mut(&mut self) -> &mut RecipeGenerator {
+        &mut self.recipe_generator
+    }
+
     /// Clear expired recipes from cache
     pub fn cleanup_expired_recipes(&mut self) {
         let now = SystemTime::now();
@@ -343,6 +353,18 @@ impl RecipeGenerator {
             base_seed,
             recipe_counter: 0,
         })
+    }
+
+    /// Get the base seed used for RNG initialization
+    pub fn get_base_seed(&self) -> u64 {
+        self.base_seed
+    }
+
+    /// Reseed the chaos RNG with a new seed
+    pub fn reseed(&mut self, new_seed: u64) {
+        self.base_seed = new_seed;
+        self.chaos_rng = StdRng::seed_from_u64(new_seed);
+        tracing::debug!("RecipeGenerator reseeded with seed: {}", new_seed);
     }
 
     /// Generate a unique packet recipe

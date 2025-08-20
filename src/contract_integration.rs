@@ -240,6 +240,44 @@ impl ContractIntegration {
     pub fn node_id(&self) -> String {
         self.node_keys.node_id()
     }
+
+    /// Get the contract address being monitored
+    pub fn get_contract_address(&self) -> &str {
+        &self.contract_address
+    }
+
+    /// Get the Ronin configuration
+    pub fn get_config(&self) -> &RoninConfig {
+        &self.config
+    }
+
+    /// Get the Ronin client for blockchain operations
+    pub fn get_ronin_client(&self) -> &Arc<RoninClient> {
+        &self.ronin_client
+    }
+
+    /// Check contract connectivity using the Ronin client
+    pub async fn check_contract_connectivity(&self) -> Result<bool, NexusError> {
+        let client = self.get_ronin_client();
+        let is_connected = client.check_connectivity().await;
+        Ok(is_connected)
+    }
+
+    /// Get current gas price for contract operations
+    pub async fn get_current_gas_price(&self) -> Result<u64, NexusError> {
+        let client = self.get_ronin_client();
+        let gas_price = client.get_gas_price().await
+            .map_err(|e| NexusError::NetworkConnection(format!("Failed to get gas price: {}", e)))?;
+        Ok(gas_price)
+    }
+
+    /// Get current block number for contract monitoring
+    pub async fn get_current_block_number(&self) -> Result<u64, NexusError> {
+        let client = self.get_ronin_client();
+        let block_number = client.get_block_number().await
+            .map_err(|e| NexusError::NetworkConnection(format!("Failed to get block number: {}", e)))?;
+        Ok(block_number)
+    }
 }
 
 /// Contract event types
