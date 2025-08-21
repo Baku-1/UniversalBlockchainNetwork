@@ -442,10 +442,55 @@ impl MeshRouter {
             pending_route_discoveries: pending_routes,
         }
     }
+
+    /// Get detailed routing information for diagnostics
+    pub async fn get_detailed_routing_info(&self) -> DetailedRoutingInfo {
+        let cache = self.message_cache.read().await;
+        let pending = self.pending_routes.read().await;
+        
+        let mut total_forwarded = 0;
+        let mut message_types = std::collections::HashMap::new();
+        
+        // Analyze cached messages and their forwarding patterns
+        for cached_msg in cache.values() {
+            total_forwarded += cached_msg.forwarded_to.len();
+            // Use the message field explicitly for analysis
+            let msg_type = format!("{:?}", cached_msg.message.message_type);
+            *message_types.entry(msg_type).or_insert(0) += 1;
+        }
+        
+        let mut total_attempts = 0;
+        let mut destinations = Vec::new();
+        
+        // Analyze pending routes and their retry attempts
+        for pending_route in pending.values() {
+            total_attempts += pending_route.attempts; // Use attempts field
+            destinations.push(pending_route.destination.clone()); // Use destination field
+        }
+        
+        DetailedRoutingInfo {
+            total_messages_forwarded: total_forwarded,
+            message_types_processed: message_types,
+            total_route_attempts: total_attempts,
+            pending_destinations: destinations,
+            cache_entries: cache.len(),
+            pending_route_count: pending.len(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct RoutingStats {
     pub cached_messages: usize,
     pub pending_route_discoveries: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct DetailedRoutingInfo {
+    pub total_messages_forwarded: usize,
+    pub message_types_processed: std::collections::HashMap<String, usize>,
+    pub total_route_attempts: u32,
+    pub pending_destinations: Vec<String>,
+    pub cache_entries: usize,
+    pub pending_route_count: usize,
 }

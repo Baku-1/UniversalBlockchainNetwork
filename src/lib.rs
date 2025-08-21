@@ -18,6 +18,7 @@ pub mod task_distributor;
 pub mod secure_execution;
 pub mod white_noise_crypto;
 pub mod polymorphic_matrix;
+pub mod engine_shell;
 
 // Modules that depend on the above modules
 pub mod web3;
@@ -54,3 +55,4 @@ pub use task_distributor::{TaskDistributor, DeviceCapability, BalancingStrategy}
 pub use secure_execution::{SecureExecutionEngine, SecurityStatus, SecurityLevel, SecurityAuditResult};
 pub use white_noise_crypto::{WhiteNoiseEncryption, WhiteNoiseConfig, EncryptionAlgorithm, NoisePattern};
 pub use polymorphic_matrix::{PolymorphicMatrix, PacketRecipe, PolymorphicPacket, PacketType, LayerType};
+pub use engine_shell::{EngineShellEncryption, EngineShellConfig, EncryptedEngineShell, EngineShellLayer};
