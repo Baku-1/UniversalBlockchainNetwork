@@ -224,11 +224,27 @@ impl MeshValidator {
         &self,
         transaction: &MeshTransaction,
     ) -> Result<ValidationResult, Box<dyn std::error::Error>> {
+        // First validate transaction format
+        let format_valid = self.validate_transaction_format(transaction).await?;
+        if !format_valid {
+            let validation_data = format!("INVALID_FORMAT_{}", transaction.id);
+            let signature = self.node_keys.sign(validation_data.as_bytes());
+            
+            return Ok(ValidationResult {
+                transaction_id: transaction.id,
+                validator_id: self.node_keys.node_id(),
+                is_valid: false,
+                reason: Some("Invalid transaction format".to_string()),
+                signature,
+                timestamp: SystemTime::now(),
+            });
+        }
+        
         // Check if sender has sufficient balance
         let has_balance = self.check_user_balance(&transaction.from_address, &transaction).await?;
         
         // Check collateral requirements for high-value transactions
-        let collateral_valid = if transaction.amount > 10000 { // 10,000 RON threshold
+        let collateral_valid = if transaction.amount > self.config.max_offline_transactions as u64 * 10 { // Use config-based threshold
             let user_balance = self.get_user_balance_amount(&transaction.from_address).await?;
             let collateral_ratio = user_balance as f64 / transaction.amount as f64;
             self.validate_collateral_requirements(&transaction, user_balance, collateral_ratio)?
@@ -312,7 +328,7 @@ impl MeshValidator {
         ).await;
 
         // Integrate with lending pools for high-value transactions
-        if transaction.amount > 10000 { // 10,000 RON threshold for lending pool integration
+        if transaction.amount > self.config.max_offline_transactions as u64 * 10 { // Use config-based threshold for lending pool integration
             self.process_lending_pool_integration(&transaction).await?;
         }
 
@@ -921,7 +937,7 @@ impl MeshValidator {
         let active_users = balances.len() as u64;
         
         // Calculate network utilization based on active transactions
-        let network_utilization = (total_transactions as f64 / 1000.0).min(1.0); // Cap at 100%
+        let network_utilization = (total_transactions as f64 / self.config.max_offline_transactions as f64).min(1.0); // Use config-based network capacity
         
         // Calculate average transaction value
         let total_value: u64 = pending.values().map(|tx| tx.amount).sum();

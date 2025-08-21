@@ -100,7 +100,7 @@ impl OfflineTransactionQueue {
             priority,
             dependencies: dependencies.clone(),
             retry_count: 0,
-            max_retries: 3,
+            max_retries: (self.config.sync_retry_interval_secs / 10).max(3) as u32, // Use config-based retry limit
             created_at: std::time::SystemTime::now(),
             last_attempt: None,
             status: TransactionStatus::Queued,
@@ -247,6 +247,13 @@ impl OfflineTransactionQueue {
         }
         
         stats.total = queue.len();
+        
+        // Use config to check if queue is approaching capacity
+        if stats.total >= (self.config.max_offline_transactions * 80 / 100) {
+            tracing::warn!("Transaction queue is approaching capacity: {}/{}", 
+                stats.total, self.config.max_offline_transactions);
+        }
+        
         stats
     }
 

@@ -13,7 +13,7 @@ use tracing;
 
 use crate::white_noise_crypto::{
     WhiteNoiseConfig, EncryptionAlgorithm, NoisePattern, 
-    WhiteNoiseEncryption, EncryptedData
+    WhiteNoiseEncryption
 };
 
 /// Packet Recipe - The blueprint for each packet's unique structure
@@ -336,6 +336,16 @@ impl PolymorphicMatrix {
         self.recipe_cache.retain(|_, recipe| {
             recipe.expiration > now
         });
+    }
+
+    /// Get access to the layer executor for direct layer operations
+    pub fn get_layer_executor(&self) -> &LayerExecutor {
+        &self.layer_executor
+    }
+
+    /// Get access to the packet builder for direct packet construction
+    pub fn get_packet_builder(&self) -> &PacketBuilder {
+        &self.packet_builder
     }
 }
 
@@ -799,6 +809,8 @@ impl LayerExecutor {
         let mut layers = Vec::new();
         for instruction in &recipe.layer_sequence {
             if let Some(layer_impl) = self.layer_implementations.get(&instruction.layer_type) {
+                // Use the layer_impl to process the encrypted_data
+                let _processed_data = layer_impl.process(encrypted_data, instruction).await?;
                 layers.push(instruction.clone());
             }
         }

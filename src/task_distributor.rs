@@ -826,6 +826,16 @@ impl ComplexityAnalyzer {
     /// Record an observation for post-hoc analysis
     pub async fn record_observation(&self, record: ComplexityRecord) {
         let mut history = self.historical_data.write().await;
+        
+        // Use timestamp to filter old records (older than 24 hours)
+        let now = SystemTime::now();
+        let twenty_four_hours_ago = now - Duration::from_secs(24 * 60 * 60);
+        
+        // Remove old records based on timestamp
+        history.retain(|existing_record| {
+            existing_record.timestamp > twenty_four_hours_ago
+        });
+        
         history.push(record);
         if history.len() > 1000 {
             // Keep bounded history

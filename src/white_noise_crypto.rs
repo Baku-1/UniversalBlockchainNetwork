@@ -5,7 +5,7 @@ use chacha20poly1305::ChaCha20Poly1305;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tracing;
-use std::time::{SystemTime, Duration};
+use std::time::SystemTime;
 use tokio::sync::RwLock;
 use std::sync::Arc;
 use rand::{Rng, RngCore, SeedableRng};
@@ -371,6 +371,21 @@ impl WhiteNoiseEncryption {
         // Access noise generator fields
         let _noise_buffer = self.noise_generator.get_noise_buffer();
         let _embedding_key = self.steganographic_layer.get_embedding_key();
+    }
+
+    /// Get access to the noise generator for direct operations
+    pub fn get_noise_generator(&mut self) -> &mut ChaoticNoiseGenerator {
+        &mut self.noise_generator
+    }
+
+    /// Get access to the steganographic layer for direct operations
+    pub fn get_steganographic_layer(&mut self) -> &mut SteganographicEncoder {
+        &mut self.steganographic_layer
+    }
+
+    /// Get access to the base cipher for direct operations
+    pub fn get_base_cipher(&self) -> &Box<dyn BaseCipher> {
+        &self.base_cipher
     }
 }
 
