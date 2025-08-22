@@ -475,7 +475,8 @@ impl RiskAssessor {
         let name = model.model_name.clone();
         let factor_count = model.risk_factors.len();
         let weights_sum: f64 = model.weights.iter().sum();
-        let _threshold = model.threshold; // Access threshold to mark it used
+        let threshold = model.threshold; // Access threshold to mark it used
+        tracing::debug!("Risk model '{}' threshold: {}", name, threshold);
         // Access each risk factor fields to mark them used
         for f in &model.risk_factors {
             let _ = (&f.name, f.value, f.weight, &f.description);

@@ -6,6 +6,8 @@ use std::sync::Arc;
 use ethers::{
     providers::{Http, Provider, Middleware},
     types::{Address, U256, H256, TransactionRequest},
+    abi::{encode, Token},
+    utils::keccak256,
 };
 use crate::config::RoninConfig;
 use crate::token_registry::CrossChainTokenRegistry;
@@ -158,7 +160,7 @@ impl RoninClient {
             .map_err(|e| format!("Invalid to address: {}", e))?;
 
         // Create transaction request
-        let _tx_request = TransactionRequest::new()
+        let tx_request = TransactionRequest::new()
             .from(from_addr)
             .to(to_addr)
             .value(U256::from(tx.value))
@@ -171,6 +173,11 @@ impl RoninClient {
         // Note: For actual transaction submission, you would need a wallet/signer
         // This is a read-only implementation for the utility application
         // In a real game, developers would integrate their own signing mechanism
+        
+        // Log transaction request details for debugging
+        tracing::debug!("Transaction request prepared - From: {}, To: {}, Value: {}, Gas: {}", 
+            from_addr, to_addr, tx.value, tx.gas_limit);
+        tracing::debug!("Transaction request data size: {} bytes", tx_request.data.as_ref().map(|d| d.len()).unwrap_or(0));
 
         // For now, we'll simulate the transaction hash generation
         // Real implementation would use: provider.send_transaction(tx_request, None).await
@@ -261,11 +268,14 @@ impl RoninClient {
             return Err("No connectivity to Ronin network".to_string());
         }
 
-        // Parse addresses
-        let _from_addr: Address = tx.from.parse()
+        // Parse addresses for validation
+        let from_addr: Address = tx.from.parse()
             .map_err(|e| format!("Invalid from address: {}", e))?;
-        let _to_addr: Address = tx.to.parse()
+        let to_addr: Address = tx.to.parse()
             .map_err(|e| format!("Invalid to address: {}", e))?;
+        
+        // Log address validation for debugging
+        tracing::debug!("Address validation - From: {}, To: {}", from_addr, to_addr);
 
         // For gas estimation in this utility application, we'll use a simplified approach
         // Real game implementations would need proper transaction signing and gas estimation
@@ -304,6 +314,11 @@ impl RoninClient {
             }
             Err(e) => Err(format!("Failed to get block number: {}", e)),
         }
+    }
+
+    /// Get the chain ID for this Ronin client
+    pub fn get_chain_id(&self) -> u64 {
+        self.chain_id
     }
 
     /// Get access to the cross-chain token registry
@@ -391,7 +406,7 @@ pub mod utils {
         gas_price: u64,
         chain_id: u64,
     ) -> RoninTransaction {
-        // TODO: Encode ERC-721 transferFrom call data
+        // Encode ERC-721 transferFrom call data using proper ABI encoding
         let call_data = encode_transfer_from(&from, &to, token_id);
 
         RoninTransaction {
@@ -411,9 +426,117 @@ pub mod utils {
 
     /// Encode ERC-721 transferFrom function call
     fn encode_transfer_from(from: &str, to: &str, token_id: u64) -> Vec<u8> {
-        // TODO: Implement proper ABI encoding
-        // This is a placeholder - real implementation would use ethers-rs ABI encoding
-        format!("transferFrom({},{},{})", from, to, token_id).into_bytes()
+        // Implement proper ABI encoding using ethers-rs
+        // ERC-721 transferFrom function signature: transferFrom(address,address,uint256)
+        
+        // Parse addresses to ensure they're valid
+        let from_addr = from.parse::<Address>().expect("Invalid from address");
+        let to_addr = to.parse::<Address>().expect("Invalid to address");
+        
+        // Create function selector for transferFrom(address,address,uint256)
+        let function_signature = "transferFrom(address,address,uint256)";
+        let selector = &keccak256(function_signature.as_bytes())[0..4];
+        
+        // Encode the parameters using ethers ABI encoding
+        let tokens = vec![
+            Token::Address(from_addr),
+            Token::Address(to_addr),
+            Token::Uint(U256::from(token_id)),
+        ];
+        
+        let encoded_params = encode(&tokens);
+        
+        // Combine selector + encoded parameters
+        let mut call_data = Vec::new();
+        call_data.extend_from_slice(selector);
+        call_data.extend_from_slice(&encoded_params);
+        
+        call_data
+    }
+
+    /// Encode ERC-721 approve function call
+    pub fn encode_approve(to: &str, token_id: u64) -> Vec<u8> {
+        // ERC-721 approve function signature: approve(address,uint256)
+        let to_addr = to.parse::<Address>().expect("Invalid to address");
+        
+        let function_signature = "approve(address,uint256)";
+        let selector = &keccak256(function_signature.as_bytes())[0..4];
+        
+        let tokens = vec![
+            Token::Address(to_addr),
+            Token::Uint(U256::from(token_id)),
+        ];
+        
+        let encoded_params = encode(&tokens);
+        
+        let mut call_data = Vec::new();
+        call_data.extend_from_slice(selector);
+        call_data.extend_from_slice(&encoded_params);
+        
+        call_data
+    }
+
+    /// Encode ERC-721 setApprovalForAll function call
+    pub fn encode_set_approval_for_all(operator: &str, approved: bool) -> Vec<u8> {
+        // ERC-721 setApprovalForAll function signature: setApprovalForAll(address,bool)
+        let operator_addr = operator.parse::<Address>().expect("Invalid operator address");
+        
+        let function_signature = "setApprovalForAll(address,bool)";
+        let selector = &keccak256(function_signature.as_bytes())[0..4];
+        
+        let tokens = vec![
+            Token::Address(operator_addr),
+            Token::Bool(approved),
+        ];
+        
+        let encoded_params = encode(&tokens);
+        
+        let mut call_data = Vec::new();
+        call_data.extend_from_slice(selector);
+        call_data.extend_from_slice(&encoded_params);
+        
+        call_data
+    }
+
+    /// Encode ERC-721 mint function call (common implementation)
+    pub fn encode_mint(to: &str, token_id: u64) -> Vec<u8> {
+        // Common ERC-721 mint function signature: mint(address,uint256)
+        let to_addr = to.parse::<Address>().expect("Invalid to address");
+        
+        let function_signature = "mint(address,uint256)";
+        let selector = &keccak256(function_signature.as_bytes())[0..4];
+        
+        let tokens = vec![
+            Token::Address(to_addr),
+            Token::Uint(U256::from(token_id)),
+        ];
+        
+        let encoded_params = encode(&tokens);
+        
+        let mut call_data = Vec::new();
+        call_data.extend_from_slice(selector);
+        call_data.extend_from_slice(&encoded_params);
+        
+        call_data
+    }
+
+    /// Encode ERC-721 burn function call (common implementation)
+    pub fn encode_burn(token_id: u64) -> Vec<u8> {
+        // Common ERC-721 burn function signature: burn(uint256)
+        let function_signature = "burn(uint256)";
+        let selector = &keccak256(function_signature.as_bytes())[0..4];
+        
+        let tokens = vec![
+            Token::Uint(U256::from(token_id)),
+        ];
+        
+        let encoded_params = encode(&tokens);
+        
+        let mut call_data = Vec::new();
+        call_data.extend_from_slice(selector);
+        call_data.extend_from_slice(&encoded_params);
+        
+        call_data
     }
 
     /// Validate Ronin address format

@@ -22,6 +22,9 @@ deployments/
 *.swp
 *.swo
 *.bat
+*.md
+*.mdc
+
 # OS files
 .DS_Store
 Thumbs.db

@@ -8,6 +8,7 @@ use uuid::Uuid;
 use serde::{Deserialize, Serialize};
 use crate::mesh::{MeshMessage, MeshMessageType};
 use crate::mesh_topology::MeshTopology;
+use crate::crypto::NodeKeypair;
 
 /// Message routing manager for mesh networks
 pub struct MeshRouter {
@@ -16,6 +17,7 @@ pub struct MeshRouter {
     pending_routes: Arc<RwLock<HashMap<String, PendingRoute>>>,
     local_node_id: String,
     route_discovery_timeout: Duration,
+    node_keys: NodeKeypair,
 }
 
 #[derive(Debug, Clone)]
@@ -54,13 +56,14 @@ pub enum DiscoveryType {
 
 impl MeshRouter {
     /// Create a new mesh router
-    pub fn new(local_node_id: String, topology: Arc<RwLock<MeshTopology>>) -> Self {
+    pub fn new(local_node_id: String, topology: Arc<RwLock<MeshTopology>>, node_keys: NodeKeypair) -> Self {
         Self {
             topology,
             message_cache: Arc::new(RwLock::new(HashMap::new())),
             pending_routes: Arc::new(RwLock::new(HashMap::new())),
             local_node_id,
             route_discovery_timeout: Duration::from_secs(30),
+            node_keys,
         }
     }
 
@@ -128,7 +131,7 @@ impl MeshRouter {
             }
             None => {
                 // No route available, initiate route discovery
-                self.initiate_route_discovery(message, destination).await
+                self.initiate_route_discovery(message, destination, send_callback).await
             }
         }
     }
@@ -214,6 +217,7 @@ impl MeshRouter {
         &self,
         message: MeshMessage,
         destination: &str,
+        send_callback: impl Fn(MeshMessage, String) -> Result<(), Box<dyn std::error::Error>> + Send + Sync,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Check if we already have a pending route discovery
         {
@@ -234,11 +238,15 @@ impl MeshRouter {
         }
 
         // Start route discovery
-        self.send_route_request(destination).await
+        self.send_route_request(destination, send_callback).await
     }
 
     /// Send a route request message
-    async fn send_route_request(&self, destination: &str) -> Result<(), Box<dyn std::error::Error>> {
+    async fn send_route_request(
+        &self, 
+        destination: &str,
+        send_callback: impl Fn(MeshMessage, String) -> Result<(), Box<dyn std::error::Error>> + Send + Sync,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let discovery_message = RouteDiscoveryMessage {
             request_id: Uuid::new_v4(),
             source: self.local_node_id.clone(),
@@ -249,7 +257,7 @@ impl MeshRouter {
             discovery_type: DiscoveryType::Request,
         };
 
-        let _mesh_message = MeshMessage {
+        let mut mesh_message = MeshMessage {
             id: Uuid::new_v4(),
             sender_id: self.local_node_id.clone(),
             target_id: None, // Broadcast
@@ -258,11 +266,31 @@ impl MeshRouter {
             ttl: 10,
             hop_count: 0,
             timestamp: SystemTime::now(),
-            signature: vec![], // TODO: Sign message
+            signature: vec![], // Will be signed below
         };
+        
+        // Sign the message using node's private key
+        let message_data = bincode::serialize(&mesh_message)?;
+        mesh_message.signature = self.node_keys.sign(&message_data);
 
-        // TODO: Send the route discovery message
-        tracing::debug!("Initiated route discovery for destination: {}", destination);
+        // Send the route discovery message to all neighbors
+        let neighbors = {
+            let topology = self.topology.read().await;
+            topology.get_local_neighbors()
+        };
+        
+        tracing::debug!("Sending route discovery for destination {} to {} neighbors", 
+            destination, neighbors.len());
+        
+        // Broadcast route discovery message to all neighbors
+        for neighbor in neighbors {
+            if let Err(e) = send_callback(mesh_message.clone(), neighbor.clone()) {
+                tracing::warn!("Failed to send route discovery to neighbor {}: {}", neighbor, e);
+            } else {
+                tracing::debug!("Route discovery sent to neighbor: {}", neighbor);
+            }
+        }
+        
         Ok(())
     }
 
@@ -270,14 +298,14 @@ impl MeshRouter {
     pub async fn process_route_discovery(
         &self,
         discovery_message: RouteDiscoveryMessage,
-        send_callback: impl Fn(MeshMessage, String) -> Result<(), Box<dyn std::error::Error>>,
+        send_callback: impl Fn(MeshMessage, String) -> Result<(), Box<dyn std::error::Error>> + Send + Sync,
     ) -> Result<(), Box<dyn std::error::Error>> {
         match discovery_message.discovery_type {
             DiscoveryType::Request => {
                 self.handle_route_request(discovery_message, send_callback).await
             }
             DiscoveryType::Reply => {
-                self.handle_route_reply(discovery_message).await
+                self.handle_route_reply(discovery_message, send_callback).await
             }
             DiscoveryType::Error => {
                 self.handle_route_error(discovery_message).await
@@ -365,6 +393,7 @@ impl MeshRouter {
     async fn handle_route_reply(
         &self,
         discovery_message: RouteDiscoveryMessage,
+        send_callback: impl Fn(MeshMessage, String) -> Result<(), Box<dyn std::error::Error>> + Send + Sync,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Update topology with the discovered route
         {
@@ -372,8 +401,13 @@ impl MeshRouter {
             
             // Add route to routing table
             if discovery_message.path.len() > 1 {
-                let _destination = &discovery_message.source;
-                let _next_hop = &discovery_message.path[1];
+                let destination = &discovery_message.source;
+                let next_hop = &discovery_message.path[1];
+                
+                // Add the discovered route to the topology
+                topology.add_connection(&self.local_node_id, next_hop);
+                tracing::debug!("Added route to {} via {}", destination, next_hop);
+                
                 topology.rebuild_routing_table();
             }
         }
@@ -388,9 +422,30 @@ impl MeshRouter {
             }
         };
 
-        // TODO: Send queued messages now that we have a route
+        // Send queued messages now that we have a route
         tracing::info!("Route discovered to {}, processing {} queued messages", 
                       discovery_message.source, queued_messages.len());
+        
+        // Send each queued message using the newly discovered route
+        for queued_message in queued_messages {
+            // Get the next hop for this destination
+            let next_hop = {
+                let topology = self.topology.read().await;
+                topology.get_next_hop(&discovery_message.source).cloned()
+            };
+            
+            if let Some(next_hop) = next_hop {
+                // Forward the queued message
+                if let Err(e) = self.forward_message(queued_message, &next_hop, &send_callback).await {
+                    tracing::warn!("Failed to send queued message to {}: {}", discovery_message.source, e);
+                } else {
+                    tracing::debug!("Successfully sent queued message to {} via {}", 
+                        discovery_message.source, next_hop);
+                }
+            } else {
+                tracing::warn!("No route available for queued message to {}", discovery_message.source);
+            }
+        }
 
         Ok(())
     }
@@ -441,6 +496,11 @@ impl MeshRouter {
             cached_messages: cache_size,
             pending_route_discoveries: pending_routes,
         }
+    }
+
+    /// Get the local node ID
+    pub fn get_local_node_id(&self) -> &str {
+        &self.local_node_id
     }
 
     /// Get detailed routing information for diagnostics

@@ -810,7 +810,9 @@ impl LayerExecutor {
         for instruction in &recipe.layer_sequence {
             if let Some(layer_impl) = self.layer_implementations.get(&instruction.layer_type) {
                 // Use the layer_impl to process the encrypted_data
-                let _processed_data = layer_impl.process(encrypted_data, instruction).await?;
+                let processed_data = layer_impl.process(encrypted_data, instruction).await?;
+                tracing::debug!("Layer {} processed {} bytes -> {} bytes", 
+                    instruction.layer_id, encrypted_data.len(), processed_data.len());
                 layers.push(instruction.clone());
             }
         }

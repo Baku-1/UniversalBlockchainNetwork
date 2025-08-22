@@ -253,14 +253,155 @@ impl Web3SyncManager {
         queue_id: Uuid,
         nft_op: crate::web3::NftOperation,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // TODO: Convert NFT operations to appropriate Ronin transactions
-        // This would create ERC-721 or ERC-1155 transaction calls
+        // Convert NFT operations to appropriate Ronin transactions
+        // This creates ERC-721 or ERC-1155 transaction calls
         
-        tracing::info!("Syncing NFT operation: {:?}", nft_op.operation_type);
+        tracing::info!("Converting NFT operation {:?} to Ronin transaction", nft_op.operation_type);
         
-        // For now, mark as completed (placeholder)
-        self.transaction_queue.mark_completed(queue_id).await?;
-        Ok(())
+        // Get current nonce and gas price for the transaction
+        let nonce = self.ronin_client.get_nonce(&nft_op.from).await?;
+        let gas_price = self.ronin_client.get_gas_price().await?;
+        
+        // Capture operation type for logging before moving nft_op
+        let operation_type = nft_op.operation_type.clone();
+        
+        // Convert NFT operation to appropriate Ronin transaction based on operation type
+        let ronin_tx = match nft_op.operation_type {
+            crate::web3::NftOperationType::Transfer => {
+                // Use existing utility function for NFT transfers
+                crate::web3::utils::create_nft_transfer(
+                    nft_op.contract_address,
+                    nft_op.from,
+                    nft_op.to,
+                    nft_op.token_id,
+                    nonce,
+                    gas_price,
+                    self.ronin_client.get_chain_id(),
+                )
+            }
+            crate::web3::NftOperationType::Mint => {
+                // Create mint transaction (contract-specific implementation)
+                self.create_nft_mint_transaction(nft_op, nonce, gas_price)?
+            }
+            crate::web3::NftOperationType::Burn => {
+                // Create burn transaction
+                self.create_nft_burn_transaction(nft_op, nonce, gas_price)?
+            }
+            crate::web3::NftOperationType::Approve => {
+                // Create approve transaction
+                self.create_nft_approve_transaction(nft_op, nonce, gas_price)?
+            }
+            crate::web3::NftOperationType::SetApprovalForAll => {
+                // Create setApprovalForAll transaction
+                self.create_nft_approval_for_all_transaction(nft_op, nonce, gas_price)?
+            }
+        };
+        
+        tracing::info!("Created Ronin transaction {} for NFT operation {:?}", 
+            ronin_tx.id, operation_type);
+        
+        // Sync the converted Ronin transaction
+        self.sync_ronin_transaction(queue_id, ronin_tx).await
+    }
+
+    /// Create NFT mint transaction
+    fn create_nft_mint_transaction(
+        &self,
+        nft_op: crate::web3::NftOperation,
+        nonce: u64,
+        gas_price: u64,
+    ) -> Result<RoninTransaction, Box<dyn std::error::Error>> {
+        // Create mint transaction call data using proper ABI encoding
+        let call_data = crate::web3::utils::encode_mint(&nft_op.to, nft_op.token_id);
+        
+        Ok(RoninTransaction {
+            id: Uuid::new_v4(),
+            from: nft_op.from,
+            to: nft_op.contract_address,
+            value: 0,
+            gas_price,
+            gas_limit: 150000, // Higher gas for minting
+            nonce,
+            data: call_data,
+            chain_id: self.ronin_client.get_chain_id(),
+            created_at: std::time::SystemTime::now(),
+            status: TransactionStatus::Pending,
+        })
+    }
+
+    /// Create NFT burn transaction
+    fn create_nft_burn_transaction(
+        &self,
+        nft_op: crate::web3::NftOperation,
+        nonce: u64,
+        gas_price: u64,
+    ) -> Result<RoninTransaction, Box<dyn std::error::Error>> {
+        // Create burn transaction call data using proper ABI encoding
+        let call_data = crate::web3::utils::encode_burn(nft_op.token_id);
+        
+        Ok(RoninTransaction {
+            id: Uuid::new_v4(),
+            from: nft_op.from,
+            to: nft_op.contract_address,
+            value: 0,
+            gas_price,
+            gas_limit: 120000, // Gas for burning
+            nonce,
+            data: call_data,
+            chain_id: self.ronin_client.get_chain_id(),
+            created_at: std::time::SystemTime::now(),
+            status: TransactionStatus::Pending,
+        })
+    }
+
+    /// Create NFT approve transaction
+    fn create_nft_approve_transaction(
+        &self,
+        nft_op: crate::web3::NftOperation,
+        nonce: u64,
+        gas_price: u64,
+    ) -> Result<RoninTransaction, Box<dyn std::error::Error>> {
+        // Create approve transaction call data using proper ABI encoding
+        let call_data = crate::web3::utils::encode_approve(&nft_op.to, nft_op.token_id);
+        
+        Ok(RoninTransaction {
+            id: Uuid::new_v4(),
+            from: nft_op.from,
+            to: nft_op.contract_address,
+            value: 0,
+            gas_price,
+            gas_limit: 80000, // Gas for approval
+            nonce,
+            data: call_data,
+            chain_id: self.ronin_client.get_chain_id(),
+            created_at: std::time::SystemTime::now(),
+            status: TransactionStatus::Pending,
+        })
+    }
+
+    /// Create NFT setApprovalForAll transaction
+    fn create_nft_approval_for_all_transaction(
+        &self,
+        nft_op: crate::web3::NftOperation,
+        nonce: u64,
+        gas_price: u64,
+    ) -> Result<RoninTransaction, Box<dyn std::error::Error>> {
+        // Create setApprovalForAll transaction call data using proper ABI encoding
+        let call_data = crate::web3::utils::encode_set_approval_for_all(&nft_op.to, true);
+        
+        Ok(RoninTransaction {
+            id: Uuid::new_v4(),
+            from: nft_op.from,
+            to: nft_op.contract_address,
+            value: 0,
+            gas_price,
+            gas_limit: 90000, // Gas for approval for all
+            nonce,
+            data: call_data,
+            chain_id: self.ronin_client.get_chain_id(),
+            created_at: std::time::SystemTime::now(),
+            status: TransactionStatus::Pending,
+        })
     }
 
     /// Get current sync statistics

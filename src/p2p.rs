@@ -275,7 +275,9 @@ fn create_libp2p_keypair(node_keys: &NodeKeypair) -> Result<Libp2pKeypair, Box<d
     // For now, we'll generate a new keypair but use our node keys to seed it
     let mut hasher = DefaultHasher::new();
     node_keys.public_key().as_bytes().hash(&mut hasher);
-    let _seed = hasher.finish();
+    let seed = hasher.finish();
+    
+    tracing::debug!("Generated P2P keypair seed from node keys: {}", seed);
 
     // Generate a keypair (libp2p 0.53 doesn't take RNG parameter)
     let keypair = Libp2pKeypair::generate_ed25519();

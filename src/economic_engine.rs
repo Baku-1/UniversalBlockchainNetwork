@@ -407,6 +407,7 @@ pub struct PoolStats {
 pub struct EconomicEngine {
     pub interest_rate_engine: Arc<InterestRateEngine>,
     pub lending_pools: Arc<RwLock<HashMap<String, LendingPool>>>,
+    pub lending_pools_manager: Arc<RwLock<Option<Arc<lending_pools::LendingPoolManager>>>>,
     pub network_stats: Arc<RwLock<NetworkStats>>,
     pub collateral_requirements: CollateralRequirements,
     pub token_distribution: Arc<RwLock<HashMap<String, u64>>>,
@@ -418,6 +419,7 @@ impl EconomicEngine {
         Self {
             interest_rate_engine: Arc::new(InterestRateEngine::new()),
             lending_pools: Arc::new(RwLock::new(HashMap::new())),
+            lending_pools_manager: Arc::new(RwLock::new(None)),
             network_stats: Arc::new(RwLock::new(NetworkStats {
                 total_transactions: 0,
                 active_users: 0,
@@ -539,10 +541,18 @@ impl EconomicEngine {
     /// Set lending pools manager for automated distribution
     pub async fn set_lending_pools(&self, lending_pools: Arc<lending_pools::LendingPoolManager>) -> Result<()> {
         // Store reference to lending pools for economic operations
-        // TODO: Store the lending_pools reference for future use in economic calculations
+        // Store the lending_pools reference for future use in economic calculations
+        let mut engine = self.lending_pools_manager.write().await;
+        *engine = Some(lending_pools.clone());
         tracing::info!("Lending pools connected to economic engine (manager: {:?})", 
             std::any::type_name_of_val(&*lending_pools));
         Ok(())
+    }
+
+    /// Get lending pools manager for economic calculations
+    pub async fn get_lending_pools_manager(&self) -> Option<Arc<lending_pools::LendingPoolManager>> {
+        let manager = self.lending_pools_manager.read().await;
+        manager.clone()
     }
 
     /// Record lending pool events for economic analysis

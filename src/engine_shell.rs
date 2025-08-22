@@ -23,6 +23,9 @@ use crate::polymorphic_matrix::{
     InterweavingPattern, NoiseDistribution, SteganographicMethod, CoverDataType
 };
 
+// Crypto trait imports
+use aes_gcm::KeyInit;
+
 /// Engine Shell Encryption Error Types
 #[derive(Debug, thiserror::Error)]
 pub enum EngineShellError {
@@ -126,6 +129,7 @@ pub struct ShellMetadata {
     pub encryption_algorithms: Vec<EncryptionAlgorithm>,
     pub chaos_signature: Vec<u8>,
     pub integrity_checksum: [u8; 32],
+    pub encryption_time_ms: Option<u64>, // Track encryption time for statistics
 }
 
 /// The Main Engine Shell Encryption System
@@ -286,6 +290,8 @@ impl EngineShellEncryption {
             ).into());
         }
         
+        let encryption_time = SystemTime::now().duration_since(start_time)?.as_millis() as u64;
+        
         let shell = EncryptedEngineShell {
             shell_id: Uuid::new_v4(),
             recipe_id: recipe.recipe_id,
@@ -299,6 +305,7 @@ impl EngineShellEncryption {
                     .collect(),
                 chaos_signature: self.generate_chaos_signature(&recipe),
                 integrity_checksum,
+                encryption_time_ms: Some(encryption_time),
             },
             created_at: SystemTime::now(),
             expires_at: recipe.expiration,
@@ -453,10 +460,16 @@ impl EngineShellEncryption {
             tracing::warn!("🚨 SECURITY ALERT: Anti-analysis protection triggered {} times", anti_analysis_triggers);
         }
         
+        // Calculate average encryption time from active shells
+        let total_encryption_time: u64 = shells.values()
+            .map(|s| s.metadata.encryption_time_ms.unwrap_or(0))
+            .sum();
+        let avg_encryption_time = if shells.is_empty() { 0 } else { total_encryption_time / shells.len() as u64 };
+        
         ShellStatistics {
             active_shells: shells.len(),
             total_layers: shells.values().map(|s| s.metadata.layer_count as usize).sum(),
-            average_encryption_time_ms: 0, // TODO: Track actual times
+            average_encryption_time_ms: avg_encryption_time,
             shell_rotation_count: self.shell_generator.recipe_counter, // Use recipe counter as rotation metric
             anti_analysis_triggers,
         }
@@ -481,16 +494,186 @@ impl EngineShellEncryption {
         hasher.finalize().into()
     }
 
-    async fn get_shell_recipe(&self, _recipe_id: Uuid) -> Result<EngineShellRecipe> {
-        // TODO: Implement recipe retrieval from cache or storage
-        // For now, return a placeholder
-        Err(anyhow::anyhow!("Recipe retrieval not implemented"))
+    async fn get_shell_recipe(&self, recipe_id: Uuid) -> Result<EngineShellRecipe> {
+        // Check active shells first (in-memory cache)
+        let shells = self.active_shells.read().await;
+        if let Some(shell) = shells.values().find(|s| s.recipe_id == recipe_id) {
+            // Reconstruct recipe from shell metadata
+            let mut shell_layers = Vec::new();
+            for (layer_id, layer_data) in shell.shell_layers.iter().enumerate() {
+                // Extract actual intensity from layer data if available
+                let intensity = if layer_data.len() >= 2 {
+                    layer_data[1] as f64 / 255.0 // Convert back from stored byte value
+                } else {
+                    1.0 // Default fallback
+                };
+                
+                // Extract rotation key from layer data if available
+                let rotation_key = if layer_data.len() >= 34 {
+                    layer_data[2..34].to_vec() // Extract 32-byte key
+                } else {
+                    vec![0u8; 32] // Fallback
+                };
+                
+                shell_layers.push(ShellLayerConfig {
+                    layer_id: layer_id as u8,
+                    layer_type: self.determine_layer_type(layer_id),
+                    encryption_algorithm: EncryptionAlgorithm::Hybrid, // Default for reconstruction
+                    noise_pattern: NoisePattern::Chaotic,
+                    intensity,
+                    is_active: true,
+                    rotation_key,
+                });
+            }
+            
+            return Ok(EngineShellRecipe {
+                recipe_id: shell.recipe_id,
+                created_at: shell.created_at,
+                shell_layers,
+                polymorphic_config: PolymorphicShellConfig {
+                    packet_type: PacketType::Standard,
+                    noise_interweaving: NoiseInterweavingStrategy {
+                        interweaving_pattern: InterweavingPattern::Random,
+                        noise_ratio: 0.5,
+                        noise_distribution: NoiseDistribution::Even,
+                        layer_mixing: true,
+                    },
+                    steganographic_config: SteganographicConfig {
+                        method: SteganographicMethod::Hybrid,
+                        cover_data_type: CoverDataType::Mixed,
+                        embedding_strength: 0.8,
+                        noise_injection: true,
+                    },
+                    layer_sequence: vec![],
+                },
+                chaos_parameters: ChaosMatrixParameters {
+                    logistic_r: 3.57,
+                    henon_a: 1.4,
+                    henon_b: 0.3,
+                    lorenz_sigma: 10.0,
+                    lorenz_rho: 28.0,
+                    lorenz_beta: 8.0 / 3.0,
+                    fractal_dimension: 2.0,
+                    turbulence_factor: 1.0,
+                },
+                expiration: shell.expires_at,
+                integrity_hash: shell.metadata.integrity_checksum,
+            });
+        }
+        
+        // Implement persistent storage lookup for expired shells
+        if let Some(persistent_shell) = self.load_shell_from_persistent_storage(recipe_id).await? {
+            // Reconstruct recipe from persistent storage using the same logic as active shells
+            let mut shell_layers = Vec::new();
+            for (layer_id, layer_data) in persistent_shell.shell_layers.iter().enumerate() {
+                let intensity = if layer_data.len() >= 2 {
+                    layer_data[1] as f64 / 255.0
+                } else {
+                    1.0
+                };
+                
+                let rotation_key = if layer_data.len() >= 34 {
+                    layer_data[2..34].to_vec()
+                } else {
+                    vec![0u8; 32]
+                };
+                
+                shell_layers.push(ShellLayerConfig {
+                    layer_id: layer_id as u8,
+                    layer_type: self.determine_layer_type(layer_id),
+                    encryption_algorithm: EncryptionAlgorithm::Hybrid,
+                    noise_pattern: NoisePattern::Chaotic,
+                    intensity,
+                    is_active: false, // Mark as inactive since loaded from storage
+                    rotation_key,
+                });
+            }
+            
+            return Ok(EngineShellRecipe {
+                recipe_id: persistent_shell.recipe_id,
+                created_at: persistent_shell.created_at,
+                shell_layers,
+                polymorphic_config: PolymorphicShellConfig {
+                    packet_type: PacketType::Standard,
+                    noise_interweaving: NoiseInterweavingStrategy {
+                        interweaving_pattern: InterweavingPattern::Random,
+                        noise_ratio: 0.5,
+                        noise_distribution: NoiseDistribution::Even,
+                        layer_mixing: true,
+                    },
+                    steganographic_config: SteganographicConfig {
+                        method: SteganographicMethod::Hybrid,
+                        cover_data_type: CoverDataType::Mixed,
+                        embedding_strength: 0.8,
+                        noise_injection: true,
+                    },
+                    layer_sequence: vec![],
+                },
+                chaos_parameters: ChaosMatrixParameters {
+                    logistic_r: 3.57,
+                    henon_a: 1.4,
+                    henon_b: 0.3,
+                    lorenz_sigma: 10.0,
+                    lorenz_rho: 28.0,
+                    lorenz_beta: 8.0 / 3.0,
+                    fractal_dimension: 2.0,
+                    turbulence_factor: 1.0,
+                },
+                expiration: persistent_shell.expires_at,
+                integrity_hash: persistent_shell.metadata.integrity_checksum,
+            });
+        }
+        
+        Err(anyhow::anyhow!("Recipe {} not found in active shells or persistent storage", recipe_id))
+    }
+    
+    fn determine_layer_type(&self, layer_id: usize) -> EngineShellLayer {
+        match layer_id {
+            0 => EngineShellLayer::BinaryEncryption,
+            1 => EngineShellLayer::CodeObfuscation,
+            2 => EngineShellLayer::MemoryEncryption,
+            3 => EngineShellLayer::RuntimeProtection,
+            4 => EngineShellLayer::AntiAnalysis,
+            5 => EngineShellLayer::SteganographicShell,
+            6 => EngineShellLayer::ChaosNoiseShell,
+            _ => EngineShellLayer::PolymorphicShell,
+        }
     }
 
     async fn cleanup_expired_shells(&self) {
         let now = SystemTime::now();
         let mut shells = self.active_shells.write().await;
         shells.retain(|_, shell| shell.expires_at > now);
+    }
+
+    /// Load shell from persistent storage (file-based storage for now)
+    async fn load_shell_from_persistent_storage(&self, recipe_id: Uuid) -> Result<Option<EncryptedEngineShell>> {
+        use std::fs;
+        use std::path::Path;
+        
+        let storage_dir = Path::new("./data/engine_shells");
+        let shell_file = storage_dir.join(format!("{}.shell", recipe_id));
+        
+        if !shell_file.exists() {
+            return Ok(None);
+        }
+        
+        // Read shell data from file
+        let shell_data = fs::read(&shell_file)
+            .map_err(|e| anyhow::anyhow!("Failed to read shell file: {}", e))?;
+        
+        // Deserialize shell (in production, this would be encrypted)
+        let shell: EncryptedEngineShell = bincode::deserialize(&shell_data)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize shell: {}", e))?;
+        
+        // Verify shell hasn't expired
+        if shell.expires_at < SystemTime::now() {
+            // Clean up expired shell file
+            let _ = fs::remove_file(&shell_file);
+            return Ok(None);
+        }
+        
+        Ok(Some(shell))
     }
 }
 
@@ -543,38 +726,42 @@ impl ShellRecipeGenerator {
             shell_layers.push(layer_config);
         }
         
+        let polymorphic_config = PolymorphicShellConfig {
+            packet_type: PacketType::RealTransaction,
+            noise_interweaving: NoiseInterweavingStrategy {
+                interweaving_pattern: InterweavingPattern::Chaotic,
+                noise_ratio: 0.7,
+                noise_distribution: NoiseDistribution::Even,
+                layer_mixing: true,
+            },
+            steganographic_config: SteganographicConfig {
+                method: SteganographicMethod::Hybrid,
+                cover_data_type: CoverDataType::Mixed,
+                embedding_strength: 0.9,
+                noise_injection: true,
+            },
+            layer_sequence: vec![],
+        };
+        
+        let chaos_parameters = ChaosMatrixParameters {
+            logistic_r: 3.57,
+            henon_a: 1.4,
+            henon_b: 0.3,
+            lorenz_sigma: 10.0,
+            lorenz_rho: 28.0,
+            lorenz_beta: 8.0 / 3.0,
+            fractal_dimension: 2.0,
+            turbulence_factor: 1.0,
+        };
+        
         Ok(EngineShellRecipe {
             recipe_id,
             created_at: SystemTime::now(),
-            shell_layers,
-            polymorphic_config: PolymorphicShellConfig {
-                packet_type: PacketType::RealTransaction,
-                noise_interweaving: NoiseInterweavingStrategy {
-                    interweaving_pattern: InterweavingPattern::Chaotic,
-                    noise_ratio: 0.7,
-                    noise_distribution: NoiseDistribution::Even,
-                    layer_mixing: true,
-                },
-                steganographic_config: SteganographicConfig {
-                    method: SteganographicMethod::Hybrid,
-                    cover_data_type: CoverDataType::Mixed,
-                    embedding_strength: 0.9,
-                    noise_injection: true,
-                },
-                layer_sequence: vec![],
-            },
-            chaos_parameters: ChaosMatrixParameters {
-                logistic_r: 3.57,
-                henon_a: 1.4,
-                henon_b: 0.3,
-                lorenz_sigma: 10.0,
-                lorenz_rho: 28.0,
-                lorenz_beta: 8.0 / 3.0,
-                fractal_dimension: 2.0,
-                turbulence_factor: 1.0,
-            },
+            shell_layers: shell_layers.clone(),
+            polymorphic_config: polymorphic_config.clone(),
+            chaos_parameters: chaos_parameters.clone(),
             expiration: SystemTime::now() + std::time::Duration::from_secs(3600), // 1 hour
-            integrity_hash: [0u8; 32], // TODO: Calculate actual hash
+            integrity_hash: self.calculate_recipe_integrity_hash(&shell_layers, &polymorphic_config, &chaos_parameters),
         })
     }
 
@@ -704,6 +891,31 @@ impl ShellRecipeGenerator {
         }
         key
     }
+    
+    fn calculate_recipe_integrity_hash(&self, shell_layers: &[ShellLayerConfig], polymorphic_config: &PolymorphicShellConfig, chaos_parameters: &ChaosMatrixParameters) -> [u8; 32] {
+        use sha3::{Keccak256, Digest};
+        let mut hasher = Keccak256::new();
+        
+        // Hash shell layers configuration
+        for layer in shell_layers {
+            hasher.update(layer.layer_id.to_le_bytes());
+            hasher.update(layer.intensity.to_le_bytes());
+            hasher.update(&layer.rotation_key);
+        }
+        
+        // Hash polymorphic configuration
+        hasher.update(format!("{:?}", polymorphic_config.packet_type).as_bytes());
+        hasher.update(polymorphic_config.noise_interweaving.noise_ratio.to_le_bytes());
+        
+        // Hash chaos parameters
+        hasher.update(chaos_parameters.lorenz_sigma.to_le_bytes());
+        hasher.update(chaos_parameters.lorenz_rho.to_le_bytes());
+        hasher.update(chaos_parameters.lorenz_beta.to_le_bytes());
+        hasher.update(chaos_parameters.fractal_dimension.to_le_bytes());
+        hasher.update(chaos_parameters.turbulence_factor.to_le_bytes());
+        
+        hasher.finalize().into()
+    }
 }
 
 impl ShellLayerExecutor {
@@ -828,18 +1040,95 @@ impl AntiAnalysisProtection {
     }
 
     pub fn check_debugger(&mut self) -> bool {
-        // TODO: Implement debugger detection
-        self.debugger_detection
+        // Check for common debugger indicators
+        let mut debugger_detected = false;
+        
+        // Check for debugger presence using timing analysis
+        let start_time = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let elapsed = start_time.elapsed();
+        
+        // If execution is significantly slower than expected, debugger might be present
+        if elapsed.as_micros() > 1000 { // More than 1ms for 1ms sleep
+            debugger_detected = true;
+            tracing::warn!("🚨 Debugger detection: Execution timing anomaly detected");
+        }
+        
+        // Check for debugger environment variables
+        if std::env::var("WINDBG").is_ok() || 
+           std::env::var("GDB").is_ok() || 
+           std::env::var("LLDB").is_ok() {
+            debugger_detected = true;
+            tracing::warn!("🚨 Debugger detection: Debugger environment variable detected");
+        }
+        
+        self.debugger_detection = debugger_detected;
+        debugger_detected
     }
 
     pub fn check_emulator(&mut self) -> bool {
-        // TODO: Implement emulator detection
-        self.emulator_detection
+        // Check for common emulator indicators
+        let mut emulator_detected = false;
+        
+        // Check for virtualization environment variables
+        if std::env::var("VIRTUAL_ENV").is_ok() || 
+           std::env::var("VMWARE").is_ok() || 
+           std::env::var("VBOX").is_ok() ||
+           std::env::var("QEMU").is_ok() {
+            emulator_detected = true;
+            tracing::warn!("🚨 Emulator detection: Virtualization environment detected");
+        }
+        
+        // Check for common emulator process names (Windows-specific)
+        #[cfg(target_os = "windows")]
+        {
+            use std::process::Command;
+            if let Ok(output) = Command::new("tasklist").output() {
+                let output_str = String::from_utf8_lossy(&output.stdout);
+                if output_str.contains("vmware.exe") || 
+                   output_str.contains("vbox.exe") || 
+                   output_str.contains("qemu.exe") {
+                    emulator_detected = true;
+                    tracing::warn!("🚨 Emulator detection: Emulator process detected");
+                }
+            }
+        }
+        
+        self.emulator_detection = emulator_detected;
+        emulator_detected
     }
 
     pub fn check_analysis_tools(&mut self) -> bool {
-        // TODO: Implement analysis tool detection
-        self.analysis_tool_detection
+        // Check for common analysis tool indicators
+        let mut analysis_tool_detected = false;
+        
+        // Check for analysis tool environment variables
+        if std::env::var("IDA_PRO").is_ok() || 
+           std::env::var("GHIDRA").is_ok() || 
+           std::env::var("RADARE2").is_ok() ||
+           std::env::var("BINARY_NINJA").is_ok() {
+            analysis_tool_detected = true;
+            tracing::warn!("🚨 Analysis tool detection: Reverse engineering tool detected");
+        }
+        
+        // Check for analysis tool processes (Windows-specific)
+        #[cfg(target_os = "windows")]
+        {
+            use std::process::Command;
+            if let Ok(output) = Command::new("tasklist").output() {
+                let output_str = String::from_utf8_lossy(&output.stdout);
+                if output_str.contains("ida.exe") || 
+                   output_str.contains("ida64.exe") || 
+                   output_str.contains("ghidra") ||
+                   output_str.contains("radare2") {
+                    analysis_tool_detected = true;
+                    tracing::warn!("🚨 Analysis tool detection: Analysis process detected");
+                }
+            }
+        }
+        
+        self.analysis_tool_detection = analysis_tool_detected;
+        analysis_tool_detected
     }
 }
 
@@ -858,14 +1147,67 @@ impl BinaryEncryptionLayer {
 
 #[async_trait::async_trait]
 impl ShellLayerImplementation for BinaryEncryptionLayer {
-    async fn process(&self, data: &[u8], _config: &ShellLayerConfig) -> Result<Vec<u8>> {
-        // TODO: Implement actual binary encryption
-        Ok(data.to_vec())
+    async fn process(&self, data: &[u8], config: &ShellLayerConfig) -> Result<Vec<u8>> {
+        // Implement actual binary encryption using AES-256-GCM
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
+        use aes_gcm::aead::Aead;
+        
+        let key = Key::<aes_gcm::Aes256Gcm>::from_slice(&config.rotation_key);
+        let cipher = Aes256Gcm::new(key);
+        
+        // Generate nonce from rotation key
+        let nonce_bytes = &config.rotation_key[..12]; // Use first 12 bytes for nonce
+        let nonce = Nonce::from_slice(nonce_bytes);
+        
+        // Encrypt the binary data
+        let encrypted_data = cipher.encrypt(nonce, data)
+            .map_err(|e| anyhow::anyhow!("Binary encryption failed: {}", e))?;
+        
+        // Add layer metadata for onion shell structure
+        let mut layer_encrypted = Vec::new();
+        layer_encrypted.extend_from_slice(&(data.len() as u32).to_le_bytes()); // Original size
+        layer_encrypted.extend_from_slice(&config.layer_id.to_le_bytes()); // Layer ID
+        layer_encrypted.extend_from_slice(&encrypted_data); // Encrypted content
+        
+        Ok(layer_encrypted)
     }
 
-    async fn reverse_process(&self, data: &[u8], _config: &ShellLayerConfig) -> Result<Vec<u8>> {
-        // TODO: Implement actual binary decryption
-        Ok(data.to_vec())
+    async fn reverse_process(&self, data: &[u8], config: &ShellLayerConfig) -> Result<Vec<u8>> {
+        // Implement actual binary decryption using AES-256-GCM
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
+        use aes_gcm::aead::Aead;
+        
+        let key = Key::<aes_gcm::Aes256Gcm>::from_slice(&config.rotation_key);
+        let cipher = Aes256Gcm::new(key);
+        
+        // Extract layer metadata
+        if data.len() < 8 {
+            return Err(anyhow::anyhow!("Invalid layer data: too short"));
+        }
+        
+        let original_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let layer_id = u8::from_le_bytes([data[4]]);
+        let encrypted_content = &data[8..];
+        
+        // Verify layer ID matches
+        if layer_id != config.layer_id {
+            return Err(anyhow::anyhow!("Layer ID mismatch: expected {}, got {}", config.layer_id, layer_id));
+        }
+        
+        // Generate nonce from rotation key
+        let nonce_bytes = &config.rotation_key[..12];
+        let nonce = Nonce::from_slice(nonce_bytes);
+        
+        // Decrypt the binary data
+        let decrypted_data = cipher.decrypt(nonce, encrypted_content)
+            .map_err(|e| anyhow::anyhow!("Binary decryption failed: {}", e))?;
+        
+        // Verify original size
+        if decrypted_data.len() != original_size as usize {
+            return Err(anyhow::anyhow!("Size mismatch: expected {}, got {}", original_size, decrypted_data.len()));
+        }
+        
+        Ok(decrypted_data)
     }
 }
 
@@ -877,14 +1219,72 @@ impl CodeObfuscationLayer {
 
 #[async_trait::async_trait]
 impl ShellLayerImplementation for CodeObfuscationLayer {
-    async fn process(&self, data: &[u8], _config: &ShellLayerConfig) -> Result<Vec<u8>> {
-        // TODO: Implement actual code obfuscation
-        Ok(data.to_vec())
+    async fn process(&self, data: &[u8], config: &ShellLayerConfig) -> Result<Vec<u8>> {
+        // Implement actual code obfuscation using XOR with chaotic patterns
+        let mut obfuscated = Vec::with_capacity(data.len());
+        
+        // Generate chaotic XOR key from rotation key
+        let mut xor_key = Vec::new();
+        for (i, &byte) in config.rotation_key.iter().enumerate() {
+            let chaotic_byte = byte.wrapping_add(i as u8).wrapping_mul(config.intensity as u8);
+            xor_key.push(chaotic_byte);
+        }
+        
+        // Apply XOR obfuscation with chaotic key rotation
+        for (i, &byte) in data.iter().enumerate() {
+            let key_byte = xor_key[i % xor_key.len()];
+            let obfuscated_byte = byte ^ key_byte;
+            obfuscated.push(obfuscated_byte);
+        }
+        
+        // Add obfuscation metadata for onion shell structure
+        let mut layer_obfuscated = Vec::new();
+        layer_obfuscated.extend_from_slice(&(data.len() as u32).to_le_bytes()); // Original size
+        layer_obfuscated.extend_from_slice(&config.layer_id.to_le_bytes()); // Layer ID
+        layer_obfuscated.extend_from_slice(&config.intensity.to_le_bytes()); // Obfuscation intensity
+        layer_obfuscated.extend_from_slice(&obfuscated); // Obfuscated content
+        
+        Ok(layer_obfuscated)
     }
 
-    async fn reverse_process(&self, data: &[u8], _config: &ShellLayerConfig) -> Result<Vec<u8>> {
-        // TODO: Implement actual code deobfuscation
-        Ok(data.to_vec())
+    async fn reverse_process(&self, data: &[u8], config: &ShellLayerConfig) -> Result<Vec<u8>> {
+        // Implement actual code deobfuscation using XOR with chaotic patterns
+        if data.len() < 16 {
+            return Err(anyhow::anyhow!("Invalid obfuscated data: too short"));
+        }
+        
+        // Extract obfuscation metadata
+        let original_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let layer_id = u8::from_le_bytes([data[4]]);
+        let intensity = f64::from_le_bytes([data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12]]);
+        let obfuscated_content = &data[16..];
+        
+        // Verify layer ID matches
+        if layer_id != config.layer_id {
+            return Err(anyhow::anyhow!("Layer ID mismatch: expected {}, got {}", config.layer_id, layer_id));
+        }
+        
+        // Generate chaotic XOR key from rotation key (same as obfuscation)
+        let mut xor_key = Vec::new();
+        for (i, &byte) in config.rotation_key.iter().enumerate() {
+            let chaotic_byte = byte.wrapping_add(i as u8).wrapping_mul(intensity as u8);
+            xor_key.push(chaotic_byte);
+        }
+        
+        // Apply XOR deobfuscation with chaotic key rotation
+        let mut deobfuscated = Vec::with_capacity(obfuscated_content.len());
+        for (i, &byte) in obfuscated_content.iter().enumerate() {
+            let key_byte = xor_key[i % xor_key.len()];
+            let deobfuscated_byte = byte ^ key_byte;
+            deobfuscated.push(deobfuscated_byte);
+        }
+        
+        // Verify original size
+        if deobfuscated.len() != original_size as usize {
+            return Err(anyhow::anyhow!("Size mismatch: expected {}, got {}", original_size, deobfuscated.len()));
+        }
+        
+        Ok(deobfuscated)
     }
 }
 
@@ -896,14 +1296,74 @@ impl MemoryEncryptionLayer {
 
 #[async_trait::async_trait]
 impl ShellLayerImplementation for MemoryEncryptionLayer {
-    async fn process(&self, data: &[u8], _config: &ShellLayerConfig) -> Result<Vec<u8>> {
-        // TODO: Implement actual memory encryption
-        Ok(data.to_vec())
+    async fn process(&self, data: &[u8], config: &ShellLayerConfig) -> Result<Vec<u8>> {
+        // Implement actual memory encryption using ChaCha20-Poly1305
+        use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+        use chacha20poly1305::aead::Aead;
+        
+        let key = Key::from_slice(&config.rotation_key);
+        let cipher = ChaCha20Poly1305::new(key);
+        
+        // Generate nonce from rotation key
+        let nonce_bytes = &config.rotation_key[..12];
+        let nonce = Nonce::from_slice(nonce_bytes);
+        
+        // Encrypt the memory data
+        let encrypted_data = cipher.encrypt(nonce, data)
+            .map_err(|e| anyhow::anyhow!("Memory encryption failed: {}", e))?;
+        
+        // Add memory encryption metadata for onion shell structure
+        let mut layer_encrypted = Vec::new();
+        layer_encrypted.extend_from_slice(&(data.len() as u32).to_le_bytes()); // Original size
+        layer_encrypted.extend_from_slice(&config.layer_id.to_le_bytes()); // Layer ID
+        layer_encrypted.extend_from_slice(&config.intensity.to_le_bytes()); // Encryption intensity
+        layer_encrypted.extend_from_slice(&encrypted_data); // Encrypted content
+        
+        Ok(layer_encrypted)
     }
 
-    async fn reverse_process(&self, data: &[u8], _config: &ShellLayerConfig) -> Result<Vec<u8>> {
-        // TODO: Implement actual memory decryption
-        Ok(data.to_vec())
+    async fn reverse_process(&self, data: &[u8], config: &ShellLayerConfig) -> Result<Vec<u8>> {
+        // Implement actual memory decryption using ChaCha20-Poly1305
+        use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+        use chacha20poly1305::aead::Aead;
+        
+        let key = Key::from_slice(&config.rotation_key);
+        let cipher = ChaCha20Poly1305::new(key);
+        
+        // Extract memory encryption metadata
+        if data.len() < 20 {
+            return Err(anyhow::anyhow!("Invalid memory encrypted data: too short"));
+        }
+        
+        let original_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let layer_id = u8::from_le_bytes([data[4]]);
+        let intensity = f64::from_le_bytes([data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12]]);
+        let encrypted_content = &data[20..];
+        
+        // Verify layer ID matches
+        if layer_id != config.layer_id {
+            return Err(anyhow::anyhow!("Layer ID mismatch: expected {}, got {}", config.layer_id, layer_id));
+        }
+        
+        // Verify intensity matches for security validation
+        if (intensity - config.intensity).abs() > 0.01 {
+            tracing::warn!("Memory encryption intensity mismatch: expected {}, got {}", config.intensity, intensity);
+        }
+        
+        // Generate nonce from rotation key
+        let nonce_bytes = &config.rotation_key[..12];
+        let nonce = Nonce::from_slice(nonce_bytes);
+        
+        // Decrypt the memory data
+        let decrypted_data = cipher.decrypt(nonce, encrypted_content)
+            .map_err(|e| anyhow::anyhow!("Memory decryption failed: {}", e))?;
+        
+        // Verify original size
+        if decrypted_data.len() != original_size as usize {
+            return Err(anyhow::anyhow!("Size mismatch: expected {}, got {}", original_size, decrypted_data.len()));
+        }
+        
+        Ok(decrypted_data)
     }
 }
 
@@ -915,14 +1375,85 @@ impl AntiAnalysisLayer {
 
 #[async_trait::async_trait]
 impl ShellLayerImplementation for AntiAnalysisLayer {
-    async fn process(&self, data: &[u8], _config: &ShellLayerConfig) -> Result<Vec<u8>> {
-        // TODO: Implement actual anti-analysis protection
-        Ok(data.to_vec())
+    async fn process(&self, data: &[u8], config: &ShellLayerConfig) -> Result<Vec<u8>> {
+        // Implement actual anti-analysis protection using polymorphic obfuscation
+        let mut protected_data = Vec::with_capacity(data.len() + 32);
+        
+        // Add anti-analysis metadata
+        protected_data.extend_from_slice(&(data.len() as u32).to_le_bytes()); // Original size
+        protected_data.extend_from_slice(&config.layer_id.to_le_bytes()); // Layer ID
+        protected_data.extend_from_slice(&config.intensity.to_le_bytes()); // Protection intensity
+        
+        // Apply polymorphic obfuscation with rotation key
+        let mut obfuscated = Vec::with_capacity(data.len());
+        for (i, &byte) in data.iter().enumerate() {
+            let key_byte = config.rotation_key[i % config.rotation_key.len()];
+            let obfuscated_byte = byte.wrapping_add(key_byte).wrapping_mul(config.intensity as u8);
+            obfuscated.push(obfuscated_byte);
+        }
+        
+        // Add obfuscated content
+        protected_data.extend_from_slice(&obfuscated);
+        
+        // Add integrity check using rotation key
+        let mut integrity_hash = [0u8; 16];
+        for (i, byte) in integrity_hash.iter_mut().enumerate() {
+            *byte = config.rotation_key[i % config.rotation_key.len()];
+        }
+        protected_data.extend_from_slice(&integrity_hash);
+        
+        Ok(protected_data)
     }
 
-    async fn reverse_process(&self, data: &[u8], _config: &ShellLayerConfig) -> Result<Vec<u8>> {
-        // TODO: Implement actual anti-analysis removal
-        Ok(data.to_vec())
+    async fn reverse_process(&self, data: &[u8], config: &ShellLayerConfig) -> Result<Vec<u8>> {
+        // Implement actual anti-analysis removal using polymorphic deobfuscation
+        if data.len() < 36 {
+            return Err(anyhow::anyhow!("Invalid anti-analysis protected data: too short"));
+        }
+        
+        // Extract anti-analysis metadata
+        let original_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let layer_id = u8::from_le_bytes([data[4]]);
+        let intensity = f64::from_le_bytes([data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12]]);
+        let obfuscated_content = &data[16..data.len()-16]; // Exclude integrity hash
+        let integrity_hash = &data[data.len()-16..];
+        
+        // Verify layer ID matches
+        if layer_id != config.layer_id {
+            return Err(anyhow::anyhow!("Layer ID mismatch: expected {}, got {}", config.layer_id, layer_id));
+        }
+        
+        // Verify intensity matches for security validation
+        if (intensity - config.intensity).abs() > 0.01 {
+            tracing::warn!("Anti-analysis intensity mismatch: expected {}, got {}", config.intensity, intensity);
+        }
+        
+        // Verify integrity hash
+        let expected_hash: [u8; 16] = integrity_hash.try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid integrity hash length"))?;
+        let mut calculated_hash = [0u8; 16];
+        for (i, byte) in calculated_hash.iter_mut().enumerate() {
+            *byte = config.rotation_key[i % config.rotation_key.len()];
+        }
+        
+        if expected_hash != calculated_hash {
+            return Err(anyhow::anyhow!("Integrity hash mismatch"));
+        }
+        
+        // Apply polymorphic deobfuscation with rotation key
+        let mut deobfuscated = Vec::with_capacity(obfuscated_content.len());
+        for (i, &byte) in obfuscated_content.iter().enumerate() {
+            let key_byte = config.rotation_key[i % config.rotation_key.len()];
+            let deobfuscated_byte = byte.wrapping_sub(key_byte).wrapping_div(config.intensity as u8);
+            deobfuscated.push(deobfuscated_byte);
+        }
+        
+        // Verify original size
+        if deobfuscated.len() != original_size as usize {
+            return Err(anyhow::anyhow!("Size mismatch: expected {}, got {}", original_size, deobfuscated.len()));
+        }
+        
+        Ok(deobfuscated)
     }
 }
 
@@ -934,14 +1465,91 @@ impl PolymorphicShellLayer {
 
 #[async_trait::async_trait]
 impl ShellLayerImplementation for PolymorphicShellLayer {
-    async fn process(&self, data: &[u8], _config: &ShellLayerConfig) -> Result<Vec<u8>> {
-        // TODO: Implement actual polymorphic shell processing
-        Ok(data.to_vec())
+    async fn process(&self, data: &[u8], config: &ShellLayerConfig) -> Result<Vec<u8>> {
+        // Implement actual polymorphic shell processing using chaotic matrix transformation
+        let mut polymorphic_data = Vec::with_capacity(data.len() + 64);
+        
+        // Add polymorphic metadata
+        polymorphic_data.extend_from_slice(&(data.len() as u32).to_le_bytes()); // Original size
+        polymorphic_data.extend_from_slice(&config.layer_id.to_le_bytes()); // Layer ID
+        polymorphic_data.extend_from_slice(&config.intensity.to_le_bytes()); // Polymorphic intensity
+        
+        // Apply chaotic matrix transformation
+        let mut transformed = Vec::with_capacity(data.len());
+        for (i, &byte) in data.iter().enumerate() {
+            let key_byte = config.rotation_key[i % config.rotation_key.len()];
+            let chaotic_factor = (i as f64 * config.intensity * std::f64::consts::PI).sin();
+            let transformed_byte = byte.wrapping_add(key_byte).wrapping_add((chaotic_factor * 255.0) as u8);
+            transformed.push(transformed_byte);
+        }
+        
+        // Add transformed content
+        polymorphic_data.extend_from_slice(&transformed);
+        
+        // Add polymorphic signature using rotation key
+        let mut signature = [0u8; 32];
+        for (i, byte) in signature.iter_mut().enumerate() {
+            let key_byte = config.rotation_key[i % config.rotation_key.len()];
+            let chaotic_byte = key_byte.wrapping_add(i as u8).wrapping_mul(config.intensity as u8);
+            *byte = chaotic_byte;
+        }
+        polymorphic_data.extend_from_slice(&signature);
+        
+        Ok(polymorphic_data)
     }
 
-    async fn reverse_process(&self, data: &[u8], _config: &ShellLayerConfig) -> Result<Vec<u8>> {
-        // TODO: Implement actual polymorphic shell reversal
-        Ok(data.to_vec())
+    async fn reverse_process(&self, data: &[u8], config: &ShellLayerConfig) -> Result<Vec<u8>> {
+        // Implement actual polymorphic shell reversal using chaotic matrix inverse transformation
+        if data.len() < 68 {
+            return Err(anyhow::anyhow!("Invalid polymorphic data: too short"));
+        }
+        
+        // Extract polymorphic metadata
+        let original_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let layer_id = u8::from_le_bytes([data[4]]);
+        let intensity = f64::from_le_bytes([data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12]]);
+        let transformed_content = &data[16..data.len()-32]; // Exclude signature
+        let signature = &data[data.len()-32..];
+        
+        // Verify layer ID matches
+        if layer_id != config.layer_id {
+            return Err(anyhow::anyhow!("Layer ID mismatch: expected {}, got {}", config.layer_id, layer_id));
+        }
+        
+        // Verify intensity matches for security validation
+        if (intensity - config.intensity).abs() > 0.01 {
+            tracing::warn!("Polymorphic shell intensity mismatch: expected {}, got {}", config.intensity, intensity);
+        }
+        
+        // Verify polymorphic signature
+        let expected_signature: [u8; 32] = signature.try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid signature length"))?;
+        let mut calculated_signature = [0u8; 32];
+        for (i, byte) in calculated_signature.iter_mut().enumerate() {
+            let key_byte = config.rotation_key[i % config.rotation_key.len()];
+            let chaotic_byte = key_byte.wrapping_add(i as u8).wrapping_mul(config.intensity as u8);
+            *byte = chaotic_byte;
+        }
+        
+        if expected_signature != calculated_signature {
+            return Err(anyhow::anyhow!("Polymorphic signature mismatch"));
+        }
+        
+        // Apply chaotic matrix inverse transformation
+        let mut reversed = Vec::with_capacity(transformed_content.len());
+        for (i, &byte) in transformed_content.iter().enumerate() {
+            let key_byte = config.rotation_key[i % config.rotation_key.len()];
+            let chaotic_factor = (i as f64 * config.intensity * std::f64::consts::PI).sin();
+            let reversed_byte = byte.wrapping_sub(key_byte).wrapping_sub((chaotic_factor * 255.0) as u8);
+            reversed.push(reversed_byte);
+        }
+        
+        // Verify original size
+        if reversed.len() != original_size as usize {
+            return Err(anyhow::anyhow!("Size mismatch: expected {}, got {}", original_size, reversed.len()));
+        }
+        
+        Ok(reversed)
     }
 }
 

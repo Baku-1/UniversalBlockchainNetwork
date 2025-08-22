@@ -803,6 +803,16 @@ impl TaskDistributor {
         let mut lb = self.load_balancer.write().await;
         lb.set_strategy(strategy);
     }
+    
+    /// Get complexity analysis from the task complexity analyzer
+    pub async fn get_complexity_analysis(&self) -> ComplexityAnalysisReport {
+        self.task_complexity_analyzer.get_complexity_analysis().await
+    }
+    
+    /// Get current balancing strategy from load balancer
+    pub async fn get_balancing_strategy(&self) -> BalancingStrategy {
+        self.load_balancer.read().await.balancing_strategy().clone()
+    }
 }
 
 /// Distributor statistics
@@ -884,6 +894,77 @@ impl ComplexityAnalyzer {
         
         Ok(complexity)
     }
+
+    /// Get complexity analysis summary for production monitoring
+    pub async fn get_complexity_analysis(&self) -> ComplexityAnalysisReport {
+        let history = self.historical_data.read().await;
+        let cache = self.complexity_cache.read().await;
+        
+        // Analyze task type performance patterns
+        let mut task_type_stats: HashMap<String, TaskTypeStats> = HashMap::new();
+        let mut total_successful_tasks = 0;
+        let mut total_failed_tasks = 0;
+        let mut total_processing_time = Duration::from_secs(0);
+        
+        for record in history.iter() {
+            let task_type_name = format!("{:?}", record.task_type);
+            let stats = task_type_stats.entry(task_type_name).or_insert(TaskTypeStats {
+                total_tasks: 0,
+                successful_tasks: 0,
+                average_processing_time: Duration::from_secs(0),
+                average_device_score: 0.0,
+            });
+            
+            stats.total_tasks += 1;
+            if record.success {
+                stats.successful_tasks += 1;
+                total_successful_tasks += 1;
+            } else {
+                total_failed_tasks += 1;
+            }
+            
+            stats.average_processing_time = Duration::from_millis(
+                (stats.average_processing_time.as_millis() as u64 + record.processing_time.as_millis() as u64) / 2
+            );
+            stats.average_device_score = (stats.average_device_score + record.device_capability.benchmark_score) / 2.0;
+            total_processing_time += record.processing_time;
+        }
+        
+        ComplexityAnalysisReport {
+            total_records: history.len(),
+            cached_complexity_scores: cache.len(),
+            task_type_performance: task_type_stats,
+            overall_success_rate: if (total_successful_tasks + total_failed_tasks) > 0 {
+                total_successful_tasks as f64 / (total_successful_tasks + total_failed_tasks) as f64
+            } else {
+                0.0
+            },
+            average_processing_time: if history.len() > 0 {
+                Duration::from_millis(total_processing_time.as_millis() as u64 / history.len() as u64)
+            } else {
+                Duration::from_secs(0)
+            },
+        }
+    }
+}
+
+/// Complexity analysis report for production monitoring
+#[derive(Debug, Clone)]
+pub struct ComplexityAnalysisReport {
+    pub total_records: usize,
+    pub cached_complexity_scores: usize,
+    pub task_type_performance: HashMap<String, TaskTypeStats>,
+    pub overall_success_rate: f64,
+    pub average_processing_time: Duration,
+}
+
+/// Task type performance statistics
+#[derive(Debug, Clone)]
+pub struct TaskTypeStats {
+    pub total_tasks: u32,
+    pub successful_tasks: u32,
+    pub average_processing_time: Duration,
+    pub average_device_score: f64,
 }
 
 impl LoadBalancer {

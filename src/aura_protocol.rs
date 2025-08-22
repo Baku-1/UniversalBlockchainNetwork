@@ -221,10 +221,12 @@ impl AuraProtocolClient {
         tracing::info!("Submitting result for task {}", result.task_id);
 
         // Convert signatures to the format expected by the contract
-        let _signatures: Vec<Bytes> = result.signatures
+        let signatures: Vec<Bytes> = result.signatures
             .iter()
             .map(|sig| Bytes::from(sig.clone()))
             .collect();
+        
+        tracing::debug!("Converted {} signatures for contract submission", signatures.len());
 
         // For now, we'll return a simulated transaction hash
         // In a real implementation, this would require a wallet/signer
