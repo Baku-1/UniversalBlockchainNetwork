@@ -79,6 +79,8 @@ pub struct MeshValidator {
     collateral_requirements: CollateralRequirements,
     // Signature threshold for contract tasks
     minimum_signature_threshold: u32,
+    
+
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
