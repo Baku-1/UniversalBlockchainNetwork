@@ -345,6 +345,8 @@ impl BluetoothMeshManager {
             // Start peer discovery simulation task
             let mesh_events = self.mesh_events.clone();
             let node_id = self.node_keys.node_id();
+            let peers = Arc::clone(&self.peers);
+            let mesh_topology = Arc::clone(&self.mesh_topology);
             tokio::spawn(async move {
                 let mut discovery_interval = tokio::time::interval(Duration::from_secs(30));
                 let mut peer_counter = 0;
@@ -378,6 +380,35 @@ impl BluetoothMeshManager {
                             },
                         };
                         
+                        // REAL BUSINESS LOGIC: Store discovered peer before sending discovery event
+                        // This ensures the peer is available when connection is attempted
+                        let peer_to_store = discovered_peer.clone();
+                        
+                        // Store the peer in the peers list
+                        {
+                            let mut peers = peers.write().await;
+                            peers.insert(peer_to_store.id.clone(), peer_to_store);
+                        }
+                        
+                        // Also add to mesh topology for routing
+                        {
+                            let mut topology = mesh_topology.write().await;
+                            topology.add_node(crate::mesh_topology::NodeInfo {
+                                node_id: discovered_peer.node_id.clone(),
+                                last_seen: discovered_peer.last_seen,
+                                hop_count: 1, // Direct peer connection
+                                connection_quality: discovered_peer.connection_quality,
+                                capabilities: vec![
+                                    "mesh_validation".to_string(),
+                                    "transaction_relay".to_string(),
+                                    "store_forward".to_string(),
+                                ],
+                            });
+                        }
+                        
+                        tracing::debug!("Stored discovered peer {} in peers list and topology", discovered_peer.id);
+                        
+                        // Now send the discovery event
                         if let Err(e) = mesh_events.send(MeshEvent::PeerDiscovered(discovered_peer)).await {
                             tracing::warn!("Failed to send PeerDiscovered event: {}", e);
                         }
@@ -591,6 +622,18 @@ impl BluetoothMeshManager {
             routing.retain(|_, next_hop| next_hop != peer_id);
         }
 
+        // REAL BUSINESS LOGIC: Don't send PeerDisconnected event here to prevent infinite loops
+        // The event should only be sent for external disconnections, not internal ones
+        // let _ = self.mesh_events.send(MeshEvent::PeerDisconnected(peer_id.to_string())).await;
+        Ok(())
+    }
+
+    /// Disconnect from a peer and notify external systems (for external disconnections)
+    pub async fn disconnect_from_peer_external(&self, peer_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // First disconnect internally
+        self.disconnect_from_peer(peer_id).await?;
+        
+        // Then notify external systems about the disconnection
         let _ = self.mesh_events.send(MeshEvent::PeerDisconnected(peer_id.to_string())).await;
         Ok(())
     }
