@@ -17,7 +17,7 @@ use crate::errors::NexusError;
 
 // Bluetooth Low Energy imports
 use btleplug::api::{Central, Manager as _, Peripheral as ApiPeripheral, ScanFilter, WriteType, CharPropFlags};
-use btleplug::platform::{Adapter, Manager, Peripheral};
+use btleplug::platform::{Adapter, Manager};
 use btleplug::Result as BtResult;
 
 /// Bluetooth mesh peer information

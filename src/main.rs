@@ -731,8 +731,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("🕸️ Mesh business service started");
 
     // Service handles are ready for management
-    // REAL BUSINESS LOGIC: Integrate unused service handles and transaction_queue_clone
-    let _service_handles = vec![matrix_handle, shell_handle, chaos_handle, sync_handle, anti_analysis_handle, mesh_handle];
+    // Keep handles separate for cleanup (they'll be aborted in shutdown)
+    // Note: sync_handle and mesh_handle are stored but not moved to avoid ownership issues
+    let _service_handles = vec![sync_handle, mesh_handle];
     let _queue_monitor = tokio::spawn({
         let transaction_queue_clone = transaction_queue_clone;
         async move {
@@ -842,7 +843,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 warn!("⚠️ System health below 80% - investigating service issues");
             }
         }
-        
+    });
+    info!("🏥 Service health monitoring started");
+
     info!("💼 All business services running");
     info!("🌐 Mesh network operational");
     info!("💰 Economic engine active");
