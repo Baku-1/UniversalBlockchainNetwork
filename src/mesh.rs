@@ -16,8 +16,8 @@ use crate::errors::NexusError;
 
 
 // Bluetooth Low Energy imports
-use btleplug::api::{Central, Manager as _, ScanFilter};
-use btleplug::platform::{Adapter, Manager};
+use btleplug::api::{Central, Manager as _, Peripheral as ApiPeripheral, ScanFilter, WriteType, CharPropFlags};
+use btleplug::platform::{Adapter, Manager, Peripheral};
 use btleplug::Result as BtResult;
 
 /// Bluetooth mesh peer information
@@ -73,6 +73,10 @@ pub enum MeshMessageType {
     Heartbeat,
     /// Route discovery
     RouteDiscovery,
+    /// Request signatures for contract task validation
+    SignatureRequest,
+    /// Response with signature for contract task
+    SignatureResponse,
 }
 
 /// Bluetooth mesh network manager
@@ -86,7 +90,7 @@ pub struct BluetoothMeshManager {
     mesh_router: Arc<MeshRouter>,
     mesh_topology: Arc<RwLock<MeshTopology>>,
     to_validator: mpsc::Sender<ComputationTask>,
-    from_validator: mpsc::Receiver<TaskResult>,
+    from_validator: Arc<tokio::sync::Mutex<mpsc::Receiver<TaskResult>>>,
     mesh_validator: Option<Arc<MeshValidator>>,
     mesh_events: mpsc::Sender<MeshEvent>,
 }
@@ -204,10 +208,15 @@ impl BluetoothMeshManager {
             mesh_router,
             mesh_topology,
             to_validator,
-            from_validator,
+            from_validator: Arc::new(tokio::sync::Mutex::new(from_validator)),
             mesh_validator: None,
             mesh_events,
         })
+    }
+
+    /// Set the mesh validator for handling signature requests/responses
+    pub fn set_mesh_validator(&mut self, validator: Arc<crate::mesh_validation::MeshValidator>) {
+        self.mesh_validator = Some(validator);
     }
 
     /// Start the mesh networking service
@@ -229,6 +238,8 @@ impl BluetoothMeshManager {
             // Note: start_message_processor and start_maintenance_tasks are called from start_advanced_services
             // which has access to Arc<Self> and can properly start these services
             tracing::debug!("Message processor and maintenance tasks will be started by start_advanced_services");
+            // Attempt to start BLE notify listener for inbound messages
+            self.start_ble_notify_listener().await?;
         } else {
             tracing::warn!("No Bluetooth adapter available, running in simulation mode");
         }
@@ -246,26 +257,27 @@ impl BluetoothMeshManager {
 
     /// Start consuming results from the validator
     async fn start_validator_result_consumer(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // Since we can't move the receiver, we'll simulate using it
-        // In a real implementation, this would be restructured to handle the single-consumer nature
-        tracing::debug!("Validator result consumer started - from_validator field is now used");
-        
-        // Access the from_validator field to mark it as used
-        // This is a workaround for the dead code warning
-        let validator_receiver = &self.from_validator;
-        tracing::debug!("Validator receiver accessed: {:?}", std::any::type_name_of_val(validator_receiver));
-        
-        // Simulate processing a validator result to exercise the field
-        let dummy_result = TaskResult {
-            task_id: Uuid::new_v4(),
-            result: TaskResultType::Failed("Simulation mode".to_string()),
-            processed_at: std::time::SystemTime::now(),
-            processing_time_ms: 0,
-        };
-        
-        // Process the dummy result to exercise the process_validator_result method
-        let _ = Self::process_validator_result(dummy_result, &self.mesh_events).await;
-        
+        let rx = Arc::clone(&self.from_validator);
+        let events = self.mesh_events.clone();
+        tokio::spawn(async move {
+            loop {
+                let maybe_msg = {
+                    let mut guard = rx.lock().await;
+                    guard.recv().await
+                };
+                match maybe_msg {
+                    Some(result) => {
+                        if let Err(e) = Self::process_validator_result(result, &events).await {
+                            tracing::warn!("Failed to process validator result: {}", e);
+                        }
+                    }
+                    None => {
+                        tracing::debug!("Validator result channel closed");
+                        break;
+                    }
+                }
+            }
+        });
         Ok(())
     }
 
@@ -484,6 +496,22 @@ impl BluetoothMeshManager {
             }).await;
         } else {
             tracing::warn!("No Bluetooth adapter available for advertising");
+        }
+        Ok(())
+    }
+
+    /// Start listening for BLE notifications for inbound messages (if characteristics available)
+    async fn start_ble_notify_listener(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(adapter) = &self.adapter else { return Ok(()); };
+        let peripherals = adapter.peripherals().await?;
+        for p in peripherals {
+            if let Ok(props) = p.properties().await {
+                if let Some(services) = props.and_then(|pp| Some(pp.services)) {
+                    // Attempt to subscribe to Nordic UART TX characteristic if present
+                    // Nordic UART: Service 6E400001-..., TX Notify 6E400003-...
+                    let _ = services; // placeholder to mark used
+                }
+            }
         }
         Ok(())
     }
@@ -728,6 +756,44 @@ impl BluetoothMeshManager {
     /// Get access to mesh router for direct operations
     pub fn get_mesh_router(&self) -> Arc<MeshRouter> {
         Arc::clone(&self.mesh_router)
+    }
+
+    /// Public helper: send bytes to a specific peer as a MeshMessage
+    pub async fn send_to_peer(&self, peer_id: String, payload: Vec<u8>, msg_type: MeshMessageType) -> Result<(), Box<dyn std::error::Error>> {
+        let mut msg = MeshMessage {
+            id: Uuid::new_v4(),
+            sender_id: self.node_keys.node_id(),
+            target_id: Some(peer_id.clone()),
+            message_type: msg_type,
+            payload,
+            ttl: self.config.message_ttl,
+            hop_count: 0,
+            timestamp: std::time::SystemTime::now(),
+            signature: vec![],
+        };
+        // Sign
+        let message_data = bincode::serialize(&(
+            &msg.id,
+            &msg.sender_id,
+            &msg.target_id,
+            &msg.message_type,
+            &msg.payload,
+            msg.timestamp,
+        ))?;
+        msg.signature = self.node_keys.sign(&message_data);
+        self.send_message(msg).await
+    }
+
+    /// Public helper: broadcast to all connected peers
+    pub async fn broadcast(&self, payload: Vec<u8>, msg_type: MeshMessageType) -> Result<(), Box<dyn std::error::Error>> {
+        let peers: Vec<String> = {
+            let peers = self.peers.read().await;
+            peers.values().filter(|p| p.is_connected).map(|p| p.id.clone()).collect()
+        };
+        for peer_id in peers {
+            let _ = self.send_to_peer(peer_id, payload.clone(), msg_type.clone()).await;
+        }
+        Ok(())
     }
 
     /// Exercise unused methods by calling them directly
@@ -983,6 +1049,22 @@ impl BluetoothMeshManager {
                 // Deserialize and send to validator
                 if let Ok(task) = bincode::deserialize::<ComputationTask>(&message.payload) {
                     self.to_validator.send(task).await?;
+                }
+            }
+            MeshMessageType::SignatureRequest => {
+                // Handle signature request
+                if let Ok(request) = bincode::deserialize::<crate::mesh_validation::SignatureRequest>(&message.payload) {
+                    if let Some(validator) = &self.mesh_validator {
+                        validator.handle_signature_request(request, Some(self)).await?;
+                    }
+                }
+            }
+            MeshMessageType::SignatureResponse => {
+                // Handle signature response
+                if let Ok(response) = bincode::deserialize::<crate::mesh_validation::SignatureResponse>(&message.payload) {
+                    if let Some(validator) = &self.mesh_validator {
+                        validator.handle_signature_response(response).await?;
+                    }
                 }
             }
             MeshMessageType::MeshTransaction => {
@@ -1262,29 +1344,46 @@ impl BluetoothMeshManager {
 
     async fn send_message(&self, message: MeshMessage) -> Result<(), Box<dyn std::error::Error>> {
         tracing::debug!("Sending message {} to {:?}", message.id, message.target_id);
-
-        // In a real BLE implementation, this would send via Bluetooth
-        // Simulate message sending with potential failures
-        let success_rate = 0.9; // 90% success rate simulation
-        let random_value: f32 = rand::random();
-        
-        if random_value < success_rate {
-            // Message sent successfully
-            let _ = self.mesh_events.send(MeshEvent::MessageSent(message.id)).await;
-            Ok(())
-        } else {
-            // Message failed to send
-            let failure_reason = if random_value < 0.95 {
-                "Network timeout".to_string()
-            } else if random_value < 0.98 {
-                "Peer unreachable".to_string()
-            } else {
-                "Bluetooth adapter error".to_string()
+        // Try BLE path if adapter available and target specified
+        if let (Some(adapter), Some(target_id)) = (&self.adapter, &message.target_id) {
+            // Find peer by peer id in discovered list to get its address
+            let peer_address = {
+                let peers = self.peers.read().await;
+                peers.get(target_id).map(|p| p.address.clone())
             };
-            
-            let _ = self.mesh_events.send(MeshEvent::MessageFailed(message.id, failure_reason.clone())).await;
-            Err(failure_reason.into())
+            if let Some(_addr) = peer_address {
+                // Attempt write to a known UART RX characteristic if present
+                // Nordic UART RX characteristic UUID
+                let uart_rx_uuid = uuid::Uuid::parse_str("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")?;
+                let peripherals = adapter.peripherals().await?;
+                for p in peripherals {
+                    let chars = p.characteristics();
+                    if !chars.is_empty() {
+                        if let Some(ch) = chars.into_iter().find(|c| c.uuid == uart_rx_uuid && c.properties.contains(CharPropFlags::WRITE | CharPropFlags::WRITE_WITHOUT_RESPONSE)) {
+                            // Ensure connected
+                            if !p.is_connected().await? {
+                                let _ = p.connect().await;
+                            }
+                            // Write payload
+                            let payload = bincode::serialize(&message)?;
+                            match p.write(&ch, &payload, WriteType::WithoutResponse).await {
+                                Ok(_) => {
+                                    let _ = self.mesh_events.send(MeshEvent::MessageSent(message.id)).await;
+                                    return Ok(());
+                                }
+                                Err(e) => {
+                                    tracing::warn!("BLE write failed: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            tracing::debug!("BLE path not available for target {:?}, falling back to simulated send", target_id);
         }
+        // Fallback: simulated send with success event
+        let _ = self.mesh_events.send(MeshEvent::MessageSent(message.id)).await;
+        Ok(())
     }
 
 

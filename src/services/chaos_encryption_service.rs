@@ -2,6 +2,7 @@
 // Chaos Encryption Service - Production-level business logic for chaos mathematics and noise generation
 
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use std::time::{SystemTime, Duration};
 use uuid::Uuid;
 use anyhow::Result;
@@ -19,15 +20,15 @@ use crate::secure_execution::SecureExecutionEngine;
 
 /// Chaos Encryption Business Service for production-level chaos mathematics and noise generation
 pub struct ChaosEncryptionService {
-    white_noise_system: Arc<WhiteNoiseEncryption>,
-    chaotic_noise_generator: Arc<tokio::sync::RwLock<ChaoticNoiseGenerator>>,
+    white_noise_system: Arc<RwLock<WhiteNoiseEncryption>>,
+    chaotic_noise_generator: Arc<RwLock<ChaoticNoiseGenerator>>,
     steganographic_encoder: Arc<SteganographicEncoder>,
     mesh_manager: Arc<BluetoothMeshManager>,
     economic_engine: Arc<EconomicEngine>,
     secure_execution_engine: Arc<SecureExecutionEngine>,
-    chaos_parameters: Arc<tokio::sync::RwLock<ChaosMatrixParameters>>,
-    noise_generation_counter: Arc<tokio::sync::RwLock<u64>>,
-    active_chaos_sessions: Arc<tokio::sync::RwLock<HashMap<Uuid, ChaosSession>>>,
+    chaos_parameters: Arc<RwLock<ChaosMatrixParameters>>,
+    noise_generation_counter: Arc<RwLock<u64>>,
+    active_chaos_sessions: Arc<RwLock<HashMap<Uuid, ChaosSession>>>,
 }
 
 /// Active chaos encryption session
@@ -45,7 +46,7 @@ pub struct ChaosSession {
 impl ChaosEncryptionService {
     /// Create a new chaos encryption service
     pub fn new(
-        white_noise_system: Arc<WhiteNoiseEncryption>,
+        white_noise_system: Arc<RwLock<WhiteNoiseEncryption>>,
         mesh_manager: Arc<BluetoothMeshManager>,
         economic_engine: Arc<EconomicEngine>,
         secure_execution_engine: Arc<SecureExecutionEngine>,
@@ -73,14 +74,14 @@ impl ChaosEncryptionService {
 
         Self {
             white_noise_system,
-            chaotic_noise_generator: Arc::new(tokio::sync::RwLock::new(chaotic_noise_generator)),
+            chaotic_noise_generator: Arc::new(RwLock::new(chaotic_noise_generator)),
             steganographic_encoder: Arc::new(steganographic_encoder),
             mesh_manager,
             economic_engine,
             secure_execution_engine,
-            chaos_parameters: Arc::new(tokio::sync::RwLock::new(initial_chaos_params)),
-            noise_generation_counter: Arc::new(tokio::sync::RwLock::new(0)),
-            active_chaos_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            chaos_parameters: Arc::new(RwLock::new(initial_chaos_params)),
+            noise_generation_counter: Arc::new(RwLock::new(0)),
+            active_chaos_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 

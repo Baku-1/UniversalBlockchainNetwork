@@ -234,6 +234,60 @@ impl LendingPool {
             min_collateral_ratio: 1.2,
         }
     }
+
+    /// Create a loan directly on a pool (convenience for tests); production uses `LendingPoolManager::create_loan`
+    pub async fn create_loan(
+        &mut self,
+        borrower_address: String,
+        lender_address: String,
+        amount: u64,
+        collateral_amount: u64,
+        term_days: u32,
+        interest_rate: f64,
+    ) -> Result<String> {
+        let loan_id = Uuid::new_v4().to_string();
+        let payment_schedule = PaymentSchedule {
+            payment_frequency: PaymentFrequency::Monthly,
+            next_payment_date: SystemTime::now() + Duration::from_secs(30 * 24 * 60 * 60),
+            payment_amount: amount / 12,
+            total_payments: 12,
+            payments_made: 0,
+        };
+        let loan = LoanDetails {
+            loan_id: loan_id.clone(),
+            borrower_address,
+            lender_address,
+            amount,
+            interest_rate,
+            collateral_amount,
+            collateral_ratio: if amount == 0 { 0.0 } else { collateral_amount as f64 / amount as f64 },
+            created_at: SystemTime::now(),
+            due_date: SystemTime::now() + Duration::from_secs(term_days as u64 * 24 * 60 * 60),
+            status: LoanStatus::Active,
+            risk_score: 0.0,
+            payment_schedule,
+            late_fees: 0,
+            total_repaid: 0,
+        };
+        self.active_loans.write().await.insert(loan_id.clone(), loan);
+        Ok(loan_id)
+    }
+
+    /// Return basic pool statistics (test helper)
+    pub async fn get_pool_stats(&self) -> PoolStats {
+        let active_loans = self.active_loans.read().await;
+        PoolStats {
+            total_deposits: self.total_deposits,
+            total_loaned: active_loans.values().map(|l| l.amount).sum(),
+            active_loans: active_loans.len(),
+            pool_utilization: self.pool_utilization,
+            risk_score: self.risk_score,
+            available_for_lending: self.total_deposits.saturating_sub(active_loans.values().map(|l| l.amount).sum()),
+            average_interest_rate: if active_loans.len() == 0 { self.interest_rate } else { active_loans.values().map(|l| l.interest_rate).sum::<f64>() / active_loans.len() as f64 },
+            total_interest_paid: 0,
+            default_rate: 0.0,
+        }
+    }
 }
 
 impl LendingPoolManager {

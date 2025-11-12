@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, RwLock, mpsc};
 use std::sync::Arc;
 use uuid::Uuid;
 use sha3::{Keccak256, Digest};
@@ -14,6 +14,7 @@ use crate::aura_protocol::{ValidationTask, TaskResult as ContractTaskResult, Tas
 use crate::contract_integration::{ContractIntegration, TaskResult as ContractTaskResultForSubmission};
 use crate::economic_engine::{EconomicEngine, NetworkStats, CollateralRequirements, LendingEligibility};
 use crate::contract_integration::ContractTask;
+use crate::mesh::BluetoothMeshManager;
 
 /// Mesh transaction that can be processed between mesh participants
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +73,8 @@ pub struct MeshValidator {
     active_contract_tasks: Arc<RwLock<HashMap<u64, ValidationTask>>>,
     contract_task_signatures: Arc<RwLock<HashMap<u64, HashMap<String, Vec<u8>>>>>, // task_id -> (node_id -> signature)
     contract_task_results: Arc<RwLock<HashMap<u64, Vec<u8>>>>, // task_id -> result_data
+    // Signature request tracking
+    pending_signature_requests: Arc<RwLock<HashMap<Uuid, mpsc::Sender<SignatureResponse>>>>, // request_id -> response_channel
     
     // Economic engine integration
     economic_engine: Arc<EconomicEngine>,
@@ -79,8 +82,8 @@ pub struct MeshValidator {
     collateral_requirements: CollateralRequirements,
     // Signature threshold for contract tasks
     minimum_signature_threshold: u32,
-    
-
+    // Mesh transport for broadcast/collect
+    mesh_transport: Option<Arc<BluetoothMeshManager>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +113,24 @@ pub enum ValidationEvent {
     ContractTaskReceived(u64),
     ContractTaskCompleted(u64, bool),
     ContractTaskSignatureCollected(u64, String),
+}
+
+/// Request for signatures from mesh validators
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureRequest {
+    pub task_id: u64,
+    pub result_data: Vec<u8>,
+    pub requester_id: String,
+    pub request_id: Uuid,
+}
+
+/// Response with signature from a mesh validator
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureResponse {
+    pub task_id: u64,
+    pub signature: String,
+    pub signer_id: String,
+    pub request_id: Uuid,
 }
 
 impl MeshValidator {
@@ -157,6 +178,7 @@ impl MeshValidator {
             active_contract_tasks: Arc::new(RwLock::new(HashMap::new())),
             contract_task_signatures: Arc::new(RwLock::new(HashMap::new())),
             contract_task_results: Arc::new(RwLock::new(HashMap::new())),
+            pending_signature_requests: Arc::new(RwLock::new(HashMap::new())),
             economic_engine: Arc::new(EconomicEngine::new()),
             collateral_requirements: CollateralRequirements {
                 minimum_ratio: 1.2,
@@ -165,9 +187,15 @@ impl MeshValidator {
                 risk_adjustment: 0.1,
             },
             minimum_signature_threshold: 3, // Require at least 3 valid signatures
+            mesh_transport: None,
         };
         
         (validator, validation_events_rx)
+    }
+
+    /// Attach mesh transport so validator can broadcast and collect over the mesh layer
+    pub fn attach_mesh_transport(&mut self, transport: Arc<BluetoothMeshManager>) {
+        self.mesh_transport = Some(transport);
     }
 
     /// Process a mesh transaction
@@ -652,6 +680,81 @@ impl MeshValidator {
         Ok(())
     }
 
+    /// Handle incoming signature response from mesh network
+    pub async fn handle_signature_response(
+        &self,
+        response: SignatureResponse,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Forward to the appropriate response channel if we have a pending request
+        {
+            let pending_requests = self.pending_signature_requests.read().await;
+            if let Some(sender) = pending_requests.get(&response.request_id) {
+                if let Err(_) = sender.send(response.clone()).await {
+                    tracing::warn!("Failed to send signature response to waiting channel for request {}", response.request_id);
+                }
+            }
+        }
+
+        // Also add to contract task signatures for compatibility
+        let signature_bytes = hex::decode(&response.signature)
+            .map_err(|_| "Invalid signature format")?;
+
+        self.add_contract_task_signature(
+            response.task_id,
+            response.signer_id,
+            signature_bytes,
+        ).await?;
+
+        Ok(())
+    }
+
+    /// Handle incoming signature request from mesh network
+    pub async fn handle_signature_request(
+        &self,
+        request: SignatureRequest,
+        mesh_transport: Option<&crate::mesh::BluetoothMeshManager>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Check if we have the task result data
+        let result_data = {
+            let results = self.contract_task_results.read().await;
+            results.get(&request.task_id).cloned()
+        };
+
+        if let Some(task_result_data) = result_data {
+            // Verify the request data matches our stored result
+            if task_result_data == request.result_data {
+                // Generate our signature for this task
+                let signature = self.sign_contract_result(request.task_id, &request.result_data)?;
+
+                // Create response
+                let response = SignatureResponse {
+                    task_id: request.task_id,
+                    signature,
+                    signer_id: self.node_keys.node_id(),
+                    request_id: request.request_id,
+                };
+
+                // Send response back to requester
+                if let Some(transport) = mesh_transport {
+                    let response_payload = bincode::serialize(&response)?;
+                    let _ = transport.send_to_peer(
+                        request.requester_id.clone(),
+                        response_payload,
+                        crate::mesh::MeshMessageType::SignatureResponse,
+                    ).await;
+
+                    tracing::debug!("Sent signature response to {} for task {}", request.requester_id, request.task_id);
+                }
+            } else {
+                tracing::warn!("Signature request data mismatch for task {}", request.task_id);
+            }
+        } else {
+            tracing::debug!("No result data found for task {} in signature request", request.task_id);
+        }
+
+        Ok(())
+    }
+
     /// Check if a contract task has enough signatures to be submitted
     async fn check_contract_task_completion(&self, task_id: u64) -> Result<(), Box<dyn std::error::Error>> {
         let (task, signatures, result) = {
@@ -828,30 +931,67 @@ impl MeshValidator {
 
     /// Collect signatures from other mesh validators
     async fn collect_mesh_signatures(&self, task_id: u64, result_data: &[u8]) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        // Implement mesh signature collection
-        // This involves:
-        // 1. Broadcasting the result to other mesh validators
-        // 2. Collecting their signatures
-        // 3. Verifying the signatures
-        // 4. Returning the collected signatures
-
+        // Start with empty collection - we only want signatures from OTHER validators
         let mut collected_signatures = Vec::new();
-        
-        // Start with our own signature
-        let our_signature = self.sign_contract_result(task_id, result_data)?;
-        collected_signatures.push(our_signature);
-        
-        // In production, this would:
-        // 1. Broadcast the result to mesh peers via mesh.rs
-        // 2. Wait for responses with signatures
-        // 3. Verify each signature using crypto.rs
-        // 4. Collect valid signatures
-        
-        // For now, simulate collecting signatures from mesh peers
-        // This would integrate with mesh.rs to get peer list and send validation requests
-        tracing::debug!("Mesh signature collection for task {}: collected {} signatures (including our own)", 
-            task_id, collected_signatures.len());
-        
+
+        // Create channel for receiving signature responses
+        let (response_tx, mut response_rx) = mpsc::channel::<SignatureResponse>(100);
+        let request_id = Uuid::new_v4();
+
+        // Register the response channel
+        {
+            let mut pending_requests = self.pending_signature_requests.write().await;
+            pending_requests.insert(request_id, response_tx);
+        }
+
+        // Broadcast signature request over mesh if transport is available
+        if let Some(transport) = &self.mesh_transport {
+            let signature_request = SignatureRequest {
+                task_id,
+                result_data: result_data.to_vec(),
+                requester_id: self.node_keys.node_id(),
+                request_id,
+            };
+
+            let request_payload = bincode::serialize(&signature_request)?;
+            let _ = transport.broadcast(request_payload, crate::mesh::MeshMessageType::SignatureRequest).await;
+        }
+
+        // Collect responses with timeout
+        let timeout_duration = std::time::Duration::from_secs(30); // 30 second timeout
+        let start_time = std::time::Instant::now();
+
+        while start_time.elapsed() < timeout_duration && collected_signatures.len() < self.minimum_signature_threshold as usize {
+            let remaining_time = timeout_duration - start_time.elapsed();
+
+            match tokio::time::timeout(remaining_time, response_rx.recv()).await {
+                Ok(Some(response)) => {
+                    // Verify the signature before adding it
+                    if self.verify_contract_task_result(task_id, result_data, &response.signature, &response.signer_id).await? {
+                        collected_signatures.push(response.signature);
+                        tracing::debug!("Collected valid signature from {} for task {}", response.signer_id, task_id);
+                    } else {
+                        tracing::warn!("Invalid signature received from {} for task {}", response.signer_id, task_id);
+                    }
+                }
+                Ok(None) => {
+                    tracing::debug!("Signature response channel closed for task {}", task_id);
+                    break;
+                }
+                Err(_) => {
+                    tracing::debug!("Timeout waiting for signature responses for task {}", task_id);
+                    break;
+                }
+            }
+        }
+
+        // Clean up the pending request
+        {
+            let mut pending_requests = self.pending_signature_requests.write().await;
+            pending_requests.remove(&request_id);
+        }
+
+        tracing::debug!("Mesh signature collection for task {} completed ({} signatures)", task_id, collected_signatures.len());
         Ok(collected_signatures)
     }
 

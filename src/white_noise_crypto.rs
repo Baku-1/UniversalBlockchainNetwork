@@ -980,7 +980,7 @@ mod tests {
             noise_pattern: NoisePattern::Chaotic,
         };
         
-        let encryption = WhiteNoiseEncryption::new(config).unwrap();
+        let mut encryption = WhiteNoiseEncryption::new(config).unwrap();
         
         let test_data = b"Hello, White Noise Encryption!";
         let key = [1u8; 32];

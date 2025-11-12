@@ -969,25 +969,49 @@ mod tests {
 
     #[tokio::test]
     async fn test_secure_execution_engine() {
+        use crate::contract_integration::ContractTask;
+        use crate::mesh_validation::MeshValidator;
+        use crate::config::RoninConfig;
+        use crate::crypto::NodeKeypair;
+
         let engine = SecureExecutionEngine::new();
-        
-        let task_data = b"test task data";
-        let expected_hash = [0u8; 32]; // This would fail in real implementation
-        
-        // This should fail due to hash mismatch
-        let result = engine.execute_secure_task(task_data, &expected_hash, "test_module").await;
-        assert!(result.is_err());
+
+        // Prepare a dummy contract task
+        let task = ContractTask {
+            id: 1,
+            requester: "tester".to_string(),
+            task_data: b"test task data".to_vec(),
+            bounty: 0,
+            created_at: 0,
+            submission_deadline: 0,
+            status: crate::contract_integration::TaskStatus::Open,
+            worker_cohort: vec![],
+            result_hash: None,
+            minimum_result_size: 1,
+            expected_result_hash: None,
+        };
+
+        // Create a mesh validator
+        let keypair = NodeKeypair::from_bytes(&[0u8; 32]).unwrap();
+        let (validator, _rx) = MeshValidator::new(keypair, RoninConfig::default());
+
+        // Execute; with placeholders, it should succeed returning data
+        let result = engine.execute_secure_task(&task, &validator).await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_code_hash_validator() {
+        use sha3::{Digest, Keccak256};
         let validator = CodeHashValidator::new();
         
         let data = b"test data";
-        let hash = data.keccak256();
+        let mut hasher = Keccak256::new();
+        hasher.update(data);
+        let hash_bytes: [u8; 32] = hasher.finalize().into();
         
         // This should pass
-        let result = validator.validate_hash(data, &hash, "test_module").await;
+        let result = validator.validate_hash(data, &hash_bytes, "test_module").await;
         assert!(result.is_ok());
     }
 

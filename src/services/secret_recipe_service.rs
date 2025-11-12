@@ -255,20 +255,31 @@ impl SecretRecipeService {
     }
 
     async fn generate_chaos_based_layer_sequence(&self, packet_type: &PacketType, data_size: usize, _security_level: SecurityLevel) -> Result<Vec<LayerInstruction>> {
-        // REAL BUSINESS LOGIC: Generate layer sequence using polymorphic matrix
-        // For now, create a simple layer sequence since we can't access the internal RecipeGenerator
-        let layer_sequence = vec![
-            LayerInstruction {
-                layer_id: 1,
-                layer_type: crate::polymorphic_matrix::LayerType::CoreEncryption,
+        // REAL BUSINESS LOGIC: Generate layer sequence based on packet_type and data_size
+        let layer_count = match packet_type {
+            PacketType::Paranoid => std::cmp::max(5, data_size / 1024),
+            PacketType::GhostProtocol => std::cmp::max(3, data_size / 2048),
+            _ => std::cmp::max(2, data_size / 4096),
+        };
+
+        let mut layer_sequence = Vec::new();
+        for i in 0..layer_count {
+            layer_sequence.push(LayerInstruction {
+                layer_id: (i + 1) as u8,
+                layer_type: match packet_type {
+                    PacketType::Paranoid => crate::polymorphic_matrix::LayerType::CoreEncryption,
+                    PacketType::GhostProtocol => crate::polymorphic_matrix::LayerType::WhiteNoiseObfuscation,
+                    _ => crate::polymorphic_matrix::LayerType::CoreEncryption,
+                },
                 encryption_algorithm: Some(EncryptionAlgorithm::AES256GCM),
                 noise_pattern: Some(NoisePattern::Random),
                 steganographic_method: Some(SteganographicMethod::LSB),
                 intensity: 0.5,
-                order: 1,
+                order: (i + 1) as u8,
                 is_noise: false,
-            }
-        ];
+            });
+        }
+
         Ok(layer_sequence)
     }
 

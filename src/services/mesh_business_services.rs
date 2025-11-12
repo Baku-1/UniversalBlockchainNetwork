@@ -1,9 +1,9 @@
 // src/services/mesh_business_services.rs
 
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 use uuid::Uuid;
-use crate::mesh::{BluetoothMeshManager, MeshEvent, MeshMessage, MeshPeer};
+use crate::mesh::{BluetoothMeshManager, MeshMessage, MeshPeer};
 use crate::mesh_topology::{MeshTopology, NodeInfo};
 use crate::transaction_queue::{OfflineTransactionQueue, TransactionType, TransactionPriority};
 use crate::store_forward::{StoreForwardManager, ForwardedMessage};
@@ -134,13 +134,18 @@ impl MeshBusinessService {
     /// Process received mesh message
     pub async fn process_mesh_message(&self, message: MeshMessage) -> Result<(), MeshBusinessError> {
         tracing::info!("🔵 Mesh Network: Message received from {}: {:?}", message.sender_id, message.message_type);
-        
-        // REAL BUSINESS LOGIC: Process the received message
-        if let Err(e) = self.mesh_manager.process_message(message).await {
+
+        // REAL BUSINESS LOGIC: Process the received message using direct mesh manager access
+        if let Err(e) = self.mesh_manager.process_message(message.clone()).await {
             tracing::warn!("🔵 Mesh Network: Failed to process message: {}", e);
             return Err(MeshBusinessError::MessageRoutingFailed(e.to_string()));
         }
-        
+
+        // DIRECT MESH MANAGER ACCESS: Update routing statistics after message processing
+        let routing_stats = self.mesh_manager.get_routing_stats().await;
+        tracing::debug!("🔵 Mesh Network: Updated routing stats - cached messages: {}, pending discoveries: {}",
+            routing_stats.cached_messages, routing_stats.pending_route_discoveries);
+
         Ok(())
     }
 
@@ -198,8 +203,8 @@ impl MeshBusinessService {
     /// Store and forward message for offline delivery
     pub async fn store_and_forward_message(&self, message: ForwardedMessage) -> Result<(), MeshBusinessError> {
         tracing::info!("🔵 Mesh Network: Storing message for forward delivery to {}", message.target_user_id);
-        
-        // REAL BUSINESS LOGIC: Store message for forward delivery
+
+        // DIRECT STORE_FORWARD_MANAGER ACCESS: Store message for forward delivery
         if let Err(e) = self.store_forward_manager.store_message(
             message.target_user_id.clone(),
             message.sender_id.clone(),
@@ -210,8 +215,12 @@ impl MeshBusinessService {
             tracing::warn!("🔵 Mesh Network: Failed to store message for forwarding: {}", e);
             return Err(MeshBusinessError::MessageRoutingFailed(e.to_string()));
         }
-        
-        tracing::debug!("🔵 Mesh Network: Stored message for forward delivery to {}", message.target_user_id);
+
+        // DIRECT STORE_FORWARD_MANAGER ACCESS: Get forwarding statistics after storing
+        let total_stored = self.store_forward_manager.get_total_stored_messages().await;
+        tracing::debug!("🔵 Mesh Network: Stored message for forward delivery to {} - total stored messages: {}",
+            message.target_user_id, total_stored);
+
         Ok(())
     }
 
@@ -275,39 +284,5 @@ impl MeshBusinessService {
     }
 }
 
-/// Process mesh events using the business service
-pub async fn process_mesh_events(
-    mut events_rx: mpsc::Receiver<MeshEvent>,
-    mesh_service: Arc<MeshBusinessService>,
-) -> Result<(), MeshBusinessError> {
-    tracing::info!("🔵 Mesh Network: Production event processor started");
-    
-    while let Some(event) = events_rx.recv().await {
-        match event {
-            MeshEvent::PeerDiscovered(peer) => {
-                mesh_service.handle_peer_discovery(peer).await?;
-            }
-            MeshEvent::PeerConnected(peer_id) => {
-                mesh_service.handle_peer_connected(peer_id).await?;
-            }
-            MeshEvent::PeerDisconnected(peer_id) => {
-                mesh_service.handle_peer_disconnected(peer_id).await?;
-            }
-            MeshEvent::MessageReceived(message) => {
-                mesh_service.process_mesh_message(message).await?;
-            }
-            MeshEvent::MessageSent(message_id) => {
-                mesh_service.handle_message_sent(message_id).await?;
-            }
-            MeshEvent::MessageFailed(message_id, reason) => {
-                mesh_service.handle_message_failed(message_id, reason).await?;
-            }
-            MeshEvent::NetworkTopologyChanged => {
-                mesh_service.handle_network_topology_changed().await?;
-            }
-        }
-    }
-    
-    Ok(())
-}
+
 
