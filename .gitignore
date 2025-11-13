@@ -15,7 +15,7 @@ typechain-types/
 # Deployment artifacts
 deployment.json
 deployments/
-
+.db
 # IDE files
 .vscode/
 .idea/
