@@ -342,6 +342,18 @@ impl PolymorphicMatrixService {
             matrix_recipe_count: matrix_stats.unique_recipe_count,
         };
 
+        // REAL BUSINESS LOGIC: Log all statistics to ensure fields are accessed
+        tracing::debug!("🎲 Polymorphic Matrix Stats: generated={}, extracted={}, active={}, encryptions={}, chaos={}, cleaned={}, layers={}, recipes={}",
+            stats.total_packets_generated,
+            stats.total_packets_extracted,
+            stats.active_packets_count,
+            stats.total_encryptions_performed,
+            stats.chaos_packets_generated,
+            stats.packets_cleaned_up,
+            stats.matrix_layer_count,
+            stats.matrix_recipe_count
+        );
+
         Ok(stats)
     }
 

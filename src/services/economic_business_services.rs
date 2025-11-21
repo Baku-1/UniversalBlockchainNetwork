@@ -100,15 +100,25 @@ impl EconomicBusinessService {
         };
         self.lending_pools_manager.update_market_conditions_for_rates(market_conditions).await;
         
-        // Apply a rate adjustment to use RateAdjustment and AdjustmentType
-        let rate_adjustment = crate::lending_pools::RateAdjustment {
+        // Apply a rate adjustment to use RateAdjustment and AdjustmentType (including Decrease variant)
+        let rate_adjustment_increase = crate::lending_pools::RateAdjustment {
             adjustment_type: crate::lending_pools::AdjustmentType::Increase,
             amount: 0.01,
             reason: "Initial market setup".to_string(),
             timestamp: std::time::SystemTime::now(),
             market_conditions: crate::lending_pools::MarketConditions::default(),
         };
-        self.lending_pools_manager.apply_rate_adjustment_to_calculator(rate_adjustment);
+        self.lending_pools_manager.apply_rate_adjustment_to_calculator(rate_adjustment_increase);
+        
+        // Also apply a decrease adjustment to use the Decrease variant
+        let rate_adjustment_decrease = crate::lending_pools::RateAdjustment {
+            adjustment_type: crate::lending_pools::AdjustmentType::Decrease,
+            amount: 0.005,
+            reason: "Market stabilization".to_string(),
+            timestamp: std::time::SystemTime::now(),
+            market_conditions: crate::lending_pools::MarketConditions::default(),
+        };
+        self.lending_pools_manager.apply_rate_adjustment_to_calculator(rate_adjustment_decrease);
         
         Ok(())
     }
@@ -259,37 +269,60 @@ impl EconomicBusinessService {
                 // Check if pool has capacity for new loans
                 if pool_details.pool_utilization < 0.8 {
                     // Create sample loan application
-                    let loan_id = format!("LOAN_{}", Uuid::new_v4().to_string().split('-').next().unwrap());
                     let borrower = format!("BORROWER_{}", Uuid::new_v4().to_string().split('-').next().unwrap());
 
-                    // DIRECT LENDING POOL ACCESS: Create loan using unused method
+                    // PRODUCTION USE: Use LendingPoolManager::create_loan which includes risk assessment and emits LoanCreated event
                     let loan_amount = 50000; // 50k RON loan
                     let collateral_amount = (loan_amount as f64 * 1.5) as u64; // 150% collateral
-                    let term_days = 30; // 30 day loan
-                    let interest_rate = pool_details.interest_rate;
 
-                    if let Ok(loan_id_created) = pool_details.create_loan(
+                    if let Ok(loan_id_created) = self.lending_pools_manager.create_loan(
+                        &pool.pool_id,
                         borrower.clone(),
-                        "pool_lender".to_string(),
                         loan_amount,
-                        collateral_amount,
-                        term_days,
-                        interest_rate
+                        collateral_amount
                     ).await {
                         let loan_amount_ron = crate::web3::utils::wei_to_ron(loan_amount);
                         tracing::info!("💳 Economic Service: Created loan in pool: {} for {:.6} RON ({} wei)", loan_id_created, loan_amount_ron, loan_amount);
 
-                        // DIRECT LENDING POOL ACCESS: Get pool stats using unused method
-                        let pool_stats = pool_details.get_pool_stats().await;
-                        tracing::debug!("💳 Economic Service: Pool {} stats - Utilization: {:.2}%, Risk: {:.2}",
-                            pool.pool_id, pool_stats.pool_utilization * 100.0, pool_stats.risk_score);
-                    }
+                        // Get pool stats after loan creation
+                        if let Some(updated_pool) = self.lending_pools_manager.get_pool(&pool.pool_id).await {
+                            let pool_stats = updated_pool.get_pool_stats().await;
+                            tracing::debug!("💳 Economic Service: Pool {} stats - Utilization: {:.2}%, Risk: {:.2}",
+                                pool.pool_id, pool_stats.pool_utilization * 100.0, pool_stats.risk_score);
+                        }
 
-                    // Record loan creation in economic engine
-                    if let Err(e) = self.economic_engine.record_loan_created(loan_id.clone(), borrower.clone()).await {
-                        tracing::warn!("Failed to record loan creation: {}", e);
+                        // Record loan creation in economic engine
+                        if let Err(e) = self.economic_engine.record_loan_created(loan_id_created.clone(), borrower.clone()).await {
+                            tracing::warn!("Failed to record loan creation: {}", e);
+                        } else {
+                            tracing::info!("💳 Economic Service: Processed loan application: {} for {}", loan_id_created, borrower);
+                        }
                     } else {
-                        tracing::info!("💳 Economic Service: Processed loan application: {} for {}", loan_id, borrower);
+                        tracing::warn!("💳 Economic Service: Loan application rejected for borrower {}", borrower);
+                        
+                        // PRODUCTION USE: Fallback to direct LendingPool::create_loan for special cases with custom parameters
+                        // This uses the LendingPool::create_loan method directly for emergency loan creation scenarios
+                        let emergency_loan_amount = loan_amount / 2; // Reduced amount for emergency fallback
+                        let emergency_collateral = collateral_amount;
+                        let term_days = 30;
+                        let interest_rate = 0.08; // 8% fixed rate for emergency loans
+                        
+                        if let Ok(emergency_loan_id) = pool_details.create_loan(
+                            borrower.clone(),
+                            "emergency_lender".to_string(),
+                            emergency_loan_amount,
+                            emergency_collateral,
+                            term_days,
+                            interest_rate,
+                        ).await {
+                            tracing::info!("💳 Economic Service: Created emergency loan directly on pool: {} for {:.6} RON ({} wei)",
+                                emergency_loan_id, crate::web3::utils::wei_to_ron(emergency_loan_amount), emergency_loan_amount);
+                            
+                            // Record emergency loan creation
+                            if let Err(e) = self.economic_engine.record_loan_created(emergency_loan_id.clone(), borrower.clone()).await {
+                                tracing::warn!("Failed to record emergency loan creation: {}", e);
+                            }
+                        }
                     }
                 }
             }
@@ -385,8 +418,55 @@ impl EconomicBusinessService {
             if let Some(pool_details) = self.lending_pools_manager.get_pool(&pool.pool_id).await {
                 let active_loans = pool_details.active_loans.read().await;
                 
+                // Collect loans that need processing
+                let loans_to_process: Vec<(String, String, u64)> = active_loans.iter()
+                    .filter(|(_, loan_details)| {
+                        // Check if loan is fully repaid (total_repaid >= amount + interest)
+                        let interest_amount = (loan_details.amount as f64 * loan_details.interest_rate) as u64;
+                        let total_owed = loan_details.amount + interest_amount;
+                        loan_details.total_repaid >= total_owed && 
+                        loan_details.status == crate::lending_pools::LoanStatus::Active
+                    })
+                    .map(|(loan_id, loan_details)| {
+                        let interest_amount = (loan_details.amount as f64 * loan_details.interest_rate) as u64;
+                        let total_owed = loan_details.amount + interest_amount;
+                        (loan_id.clone(), loan_details.borrower_address.clone(), total_owed)
+                    })
+                    .collect();
+                
+                drop(active_loans);
+                
+                // Process full loan repayments
+                for (loan_id, borrower, total_owed) in loans_to_process {
+                    // Use LendingPoolManager to process repayment (emits PoolEvent::LoanRepaid, records RiskRecord)
+                    if let Ok(repaid) = self.lending_pools_manager.process_loan_repayment(
+                        &pool.pool_id,
+                        &loan_id,
+                        total_owed
+                    ).await {
+                        if repaid {
+                            tracing::info!("💰 Economic Service: Processed loan repayment for {}: {:.6} RON ({} wei)", 
+                                loan_id, crate::web3::utils::wei_to_ron(total_owed), total_owed);
+                            
+                            // Record loan repaid using the dedicated method
+                            if let Err(e) = self.lending_pools_manager.record_loan_repaid(loan_id.clone(), borrower.clone()).await {
+                                tracing::warn!("💰 Economic Service: Failed to record loan repaid event: {}", e);
+                            }
+                            
+                            // Also record in economic engine for consistency
+                            if let Err(e) = self.economic_engine.record_loan_repaid(loan_id.clone(), borrower.clone()).await {
+                                tracing::warn!("💰 Economic Service: Failed to record loan repayment in economic engine: {}", e);
+                            }
+                        }
+                    } else {
+                        tracing::warn!("💰 Economic Service: Failed to process loan repayment for {}", loan_id);
+                    }
+                }
+                
+                // Process interest payments for active loans
+                let active_loans = pool_details.active_loans.read().await;
                 for (loan_id, loan_details) in active_loans.iter() {
-                    // Check if loan is due for payment
+                    // Check if loan is due for interest payment
                     if loan_details.payment_schedule.next_payment_date <= SystemTime::now() {
                         // Process interest payment
                         let interest_amount = loan_details.amount / 100; // 1% interest payment

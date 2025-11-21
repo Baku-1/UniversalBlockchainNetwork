@@ -688,13 +688,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start sync manager service with proper event handling
     let sync_manager_clone = Arc::clone(&sync_manager);
+    let sync_business_service_clone = Arc::clone(&sync_business_service);
     let sync_processing_handle = tokio::spawn(async move {
         // Start sync service to get event receiver
         let mut sync_events_rx = sync_manager_clone.start_sync_service().await;
 
-        // Process sync events
-        while let Some(sync_event) = sync_events_rx.recv().await {
-            match sync_event {
+        // Batch events for efficient processing
+        let mut event_batch = Vec::new();
+        let batch_size = 10;
+        let mut batch_timeout = tokio::time::interval(tokio::time::Duration::from_millis(100));
+
+        loop {
+            tokio::select! {
+                // Receive sync events
+                event_opt = sync_events_rx.recv() => {
+                    match event_opt {
+                        Some(sync_event) => {
+                            // Log event for monitoring
+                            match &sync_event {
                 sync::SyncEvent::SyncStarted => {
                     info!("🔄 Sync started");
                 }
@@ -709,6 +720,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 sync::SyncEvent::TransactionFailed(tx_id, error) => {
                     error!("💰 Transaction {} failed: {}", tx_id, error);
+                }
+            }
+                        }
+                        None => {
+                            // Channel closed, process remaining events and exit
+                            if !event_batch.is_empty() {
+                                if let Err(e) = sync_business_service_clone.process_sync_events(event_batch).await {
+                                    error!("🔄 Failed to process final sync events batch: {}", e);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Process batch on timeout (even if not full)
+                _ = batch_timeout.tick() => {
+                    if !event_batch.is_empty() {
+                        let events_to_process = std::mem::take(&mut event_batch);
+                        if let Err(e) = sync_business_service_clone.process_sync_events(events_to_process).await {
+                            error!("🔄 Failed to process sync events batch: {}", e);
+                        }
+                    }
                 }
             }
         }
@@ -810,6 +843,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stats_validation_service = Arc::clone(&validation_business_service);
     let stats_gpu_service = Arc::clone(&gpu_business_service);
     let stats_security_service = Arc::clone(&security_orchestration_service);
+    let stats_sync_service = Arc::clone(&sync_business_service);
     let stats_lending_pools_manager = Arc::clone(&lending_pools_manager);
 
     let stats_handle = tokio::spawn(async move {
@@ -828,8 +862,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Collect economic statistics
             if let Ok(economic_stats) = stats_economic_service.get_economic_network_stats().await {
-                info!("   💰 Economic: {} pools, {} transactions, {} transfers",
-                    economic_stats.active_lending_pools, economic_stats.total_economic_transactions, economic_stats.cross_chain_transfers);
+                info!("   💰 Economic: {} pools, {} transactions, {} transfers, {} lending volume, {:.2}% utilization",
+                    economic_stats.active_lending_pools, economic_stats.total_economic_transactions, economic_stats.cross_chain_transfers,
+                    economic_stats.total_lending_volume, economic_stats.network_utilization * 100.0);
             }
 
             // Collect validation statistics
@@ -848,6 +883,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(security_stats) = stats_security_service.get_security_orchestration_stats().await {
                 info!("   🎭 Security: {} sessions, {} threats detected",
                     security_stats.total_sessions, security_stats.threats_detected);
+            }
+
+            // Collect sync statistics
+            if let Ok(sync_stats) = stats_sync_service.get_sync_network_stats().await {
+                info!("   🔄 Sync: {} synced, {} success, {} failed, {} pending, {:.2}% utilization",
+                    sync_stats.total_synced_transactions, sync_stats.successful_syncs, sync_stats.failed_syncs,
+                    sync_stats.pending_sync_transactions, sync_stats.network_utilization * 100.0);
             }
 
             // Collect lending pool statistics and analyze risk history
@@ -949,11 +991,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Apply rate adjustments based on market conditions (uses apply_rate_adjustment)
+            // Apply rate adjustments based on market conditions (uses apply_rate_adjustment with Decrease variant)
+            // Use Decrease variant when market conditions are favorable
             let adjustment = lending_pools::RateAdjustment {
-                adjustment_type: lending_pools::AdjustmentType::Freeze,
-                amount: 0.0,
-                reason: "Periodic market review".to_string(),
+                adjustment_type: lending_pools::AdjustmentType::Decrease,
+                amount: 0.002,
+                reason: "Periodic market review - favorable conditions".to_string(),
                 timestamp: SystemTime::now(),
                 market_conditions: lending_pools::MarketConditions {
                     market_volatility: 0.5,

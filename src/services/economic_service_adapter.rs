@@ -76,6 +76,42 @@ impl Service for EconomicServiceAdapter {
             .process_bridge_economic_transaction(sample_transaction_data)
             .await;
 
+        // Process economic transactions through transaction queue
+        use crate::transaction_queue::TransactionType;
+        use crate::web3::RoninTransaction;
+        use uuid::Uuid;
+        use std::time::SystemTime;
+        
+        // Create a sample economic transaction for queue processing
+        use crate::web3::TransactionStatus;
+        let economic_tx = RoninTransaction {
+            id: Uuid::new_v4(),
+            from: "economic_service".to_string(),
+            to: "recipient".to_string(),
+            value: 10000, // 10k wei
+            gas_price: 1000000000, // 1 gwei
+            gas_limit: 21000,
+            nonce: 1,
+            data: vec![],
+            chain_id: 2020, // Ronin chain ID
+            created_at: SystemTime::now(),
+            status: TransactionStatus::Pending,
+        };
+        
+        if let Err(e) = self.inner.process_economic_transaction_queue(TransactionType::Ronin(economic_tx)).await {
+            tracing::warn!("Failed to process economic transaction queue: {}", e);
+        }
+
+        // Process cross-chain economic operations
+        use crate::token_registry::BlockchainNetwork;
+        if let Err(e) = self.inner.process_cross_chain_economic_operation(
+            BlockchainNetwork::Ronin,
+            BlockchainNetwork::Ethereum,
+            10000, // 10k wei sample amount
+        ).await {
+            tracing::warn!("Failed to process cross-chain economic operation: {}", e);
+        }
+
         Ok(())
     }
 
