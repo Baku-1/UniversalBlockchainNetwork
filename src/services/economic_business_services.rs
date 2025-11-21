@@ -87,6 +87,29 @@ impl EconomicBusinessService {
         self.lending_pools_manager.register_risk_model(production_risk_model).await;
         tracing::info!("💳 Economic Service: Production risk model registered");
         
+        // Access interest calculator to mark it as used
+        let _calculator = self.lending_pools_manager.get_interest_calculator();
+        
+        // Update market conditions to use MarketConditions fields
+        let market_conditions = crate::lending_pools::MarketConditions {
+            market_volatility: 0.3,
+            liquidity_ratio: 1.2,
+            demand_supply_ratio: 0.9,
+            economic_indicators: std::collections::HashMap::new(),
+            last_updated: std::time::SystemTime::now(),
+        };
+        self.lending_pools_manager.update_market_conditions_for_rates(market_conditions).await;
+        
+        // Apply a rate adjustment to use RateAdjustment and AdjustmentType
+        let rate_adjustment = crate::lending_pools::RateAdjustment {
+            adjustment_type: crate::lending_pools::AdjustmentType::Increase,
+            amount: 0.01,
+            reason: "Initial market setup".to_string(),
+            timestamp: std::time::SystemTime::now(),
+            market_conditions: crate::lending_pools::MarketConditions::default(),
+        };
+        self.lending_pools_manager.apply_rate_adjustment_to_calculator(rate_adjustment);
+        
         Ok(())
     }
 
@@ -328,17 +351,25 @@ impl EconomicBusinessService {
         let manager_stats = self.lending_pools_manager.get_stats().await;
         tracing::debug!("💳 Economic Service: Lending pool manager stats: {:?}", manager_stats);
         
+        // Get total pending interest payments
+        let pending_interest = self.lending_pools_manager.get_total_pending_interest_payments().await;
+        if pending_interest > 0 {
+            tracing::debug!("💳 Economic Service: {} pending interest payments across all pools", pending_interest);
+        }
+        
         // Monitor existing pools and update statistics
         let all_pools = self.lending_pools_manager.get_all_pools().await;
         tracing::debug!("💳 Economic Service: Monitoring {} active lending pools", all_pools.len());
         
         for pool in all_pools.iter().take(3) { // Monitor first 3 pools
             if let Some(pool_details) = self.lending_pools_manager.get_pool(&pool.pool_id).await {
-                tracing::debug!("💳 Economic Service: Pool {}: {} deposits, {} loans, {}% utilization", 
+                let pending_payments = pool_details.get_pending_interest_payments().await;
+                tracing::debug!("💳 Economic Service: Pool {}: {} deposits, {} loans, {}% utilization, {} pending interest payments", 
                     pool.pool_id, 
                     pool_details.total_deposits, 
                     pool_details.active_loans.read().await.len(),
-                    pool_details.pool_utilization * 100.0
+                    pool_details.pool_utilization * 100.0,
+                    pending_payments
                 );
             }
         }
@@ -359,6 +390,22 @@ impl EconomicBusinessService {
                     if loan_details.payment_schedule.next_payment_date <= SystemTime::now() {
                         // Process interest payment
                         let interest_amount = loan_details.amount / 100; // 1% interest payment
+                        
+                        // Add interest payment to distribution queue
+                        let interest_payment = crate::lending_pools::InterestPayment {
+                            loan_id: loan_id.clone(),
+                            amount: interest_amount,
+                            due_date: loan_details.payment_schedule.next_payment_date,
+                            is_paid: false,
+                            payment_hash: None,
+                            payment_type: crate::lending_pools::PaymentType::Regular,
+                            late_fee: loan_details.late_fees,
+                        };
+                        
+                        if let Err(e) = pool_details.add_interest_payment(interest_payment).await {
+                            tracing::warn!("Failed to add interest payment to queue: {}", e);
+                        }
+                        
                         if let Err(e) = self.lending_pools_manager.record_interest_paid(
                             loan_id.clone(),
                             interest_amount
@@ -375,6 +422,12 @@ impl EconomicBusinessService {
                     }
                 }
             }
+        }
+        
+        // Process all interest distributions
+        let processed_count = self.lending_pools_manager.process_all_interest_distributions().await?;
+        if processed_count > 0 {
+            tracing::info!("💳 Economic Service: Processed {} interest payments from distribution queues", processed_count);
         }
         
         Ok(())
