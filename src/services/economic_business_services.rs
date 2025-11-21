@@ -457,26 +457,63 @@ impl EconomicBusinessService {
                             pool.pool_id, pool_details.pool_utilization * 100.0, collateral_reqs.liquidation_threshold * 100.0);
 
                         // Check if any loans need to be liquidated
-                        let active_loans = pool_details.active_loans.read().await;
-                        for (loan_id, loan_details) in active_loans.iter() {
-                            if loan_details.collateral_ratio < collateral_reqs.maintenance_margin {
-                                tracing::warn!("💰 Economic Service: Loan {} below maintenance margin, liquidation recommended", loan_id);
-
-                                // DIRECT ECONOMIC ENGINE ACCESS: Record loan default using unused method
-                                if let Err(e) = self.economic_engine.record_loan_defaulted(loan_id.clone(), loan_details.borrower_address.clone()).await {
-                                    tracing::warn!("💰 Economic Service: Failed to record loan default: {}", e);
+                        let (loans_to_liquidate, healthy_loans): (Vec<(String, String)>, Vec<(String, String, u64)>) = {
+                            let active_loans = pool_details.active_loans.read().await;
+                            let mut to_liquidate = Vec::new();
+                            let mut healthy = Vec::new();
+                            
+                            for (loan_id, loan_details) in active_loans.iter() {
+                                if loan_details.collateral_ratio < collateral_reqs.maintenance_margin {
+                                    to_liquidate.push((loan_id.clone(), loan_details.borrower_address.clone()));
+                                } else if loan_details.amount > 0 && loan_details.status == crate::lending_pools::LoanStatus::Active {
+                                    let interest_amount = (loan_details.amount as f64 * loan_details.interest_rate) as u64;
+                                    let total_owed = loan_details.amount + interest_amount;
+                                    healthy.push((loan_id.clone(), loan_details.borrower_address.clone(), total_owed));
                                 }
-                            } else if loan_details.amount > 0 {
-                                // Process loan repayment for healthy loans
-                                let repayment_amount = loan_details.amount / 10; // 10% repayment
-
-                                // DIRECT ECONOMIC ENGINE ACCESS: Record loan repayment using unused method
-                                if let Err(e) = self.economic_engine.record_loan_repaid(loan_id.clone(), loan_details.borrower_address.clone()).await {
-                                    tracing::warn!("💰 Economic Service: Failed to record loan repayment: {}", e);
-                                } else {
-                                    let repayment_ron = crate::web3::utils::wei_to_ron(repayment_amount);
-                                    tracing::debug!("💰 Economic Service: Recorded loan repayment for {}: {:.6} RON ({} wei)", loan_id, repayment_ron, repayment_amount);
+                            }
+                            
+                            (to_liquidate, healthy)
+                        };
+                        
+                        // Process liquidations
+                        for (loan_id, borrower) in loans_to_liquidate {
+                            tracing::warn!("💰 Economic Service: Loan {} below maintenance margin, liquidating", loan_id);
+                            
+                            // Use LendingPoolManager to process liquidation (emits events, records RiskRecord with LoanOutcome::Liquidated)
+                            if let Ok(liquidated) = self.lending_pools_manager.process_loan_liquidation(
+                                &pool.pool_id,
+                                &loan_id
+                            ).await {
+                                if liquidated {
+                                    tracing::warn!("💰 Economic Service: Loan {} liquidated successfully", loan_id);
                                 }
+                            }
+                            
+                            // Also record in economic engine for consistency
+                            if let Err(e) = self.economic_engine.record_loan_defaulted(loan_id.clone(), borrower.clone()).await {
+                                tracing::warn!("💰 Economic Service: Failed to record loan default in economic engine: {}", e);
+                            }
+                        }
+                        
+                        // Process repayments for healthy loans
+                        for (loan_id, borrower, total_owed) in healthy_loans {
+                            // Use LendingPoolManager to process repayment (emits PoolEvent::LoanRepaid, records RiskRecord)
+                            if let Ok(repaid) = self.lending_pools_manager.process_loan_repayment(
+                                &pool.pool_id,
+                                &loan_id,
+                                total_owed
+                            ).await {
+                                if repaid {
+                                    tracing::info!("💰 Economic Service: Processed loan repayment for {}: {:.6} RON ({} wei)", 
+                                        loan_id, crate::web3::utils::wei_to_ron(total_owed), total_owed);
+                                    
+                                    // Also record in economic engine for consistency
+                                    if let Err(e) = self.economic_engine.record_loan_repaid(loan_id.clone(), borrower.clone()).await {
+                                        tracing::warn!("💰 Economic Service: Failed to record loan repayment in economic engine: {}", e);
+                                    }
+                                }
+                            } else {
+                                tracing::warn!("💰 Economic Service: Failed to process loan repayment for {}", loan_id);
                             }
                         }
 

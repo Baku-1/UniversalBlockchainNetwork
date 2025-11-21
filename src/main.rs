@@ -197,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("💰 Economic engine initialized");
 
     // Initialize lending pools manager
-    let (lending_pools_manager, _) = lending_pools::LendingPoolManager::new();
+    let (lending_pools_manager, pool_events_rx) = lending_pools::LendingPoolManager::new();
     let lending_pools_manager = Arc::new(lending_pools_manager);
     info!("🏦 Lending pools manager initialized");
 
@@ -638,6 +638,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     info!("📋 Queue event processing started");
 
+    // Start pool event processing
+    let pool_events_handle = tokio::spawn(async move {
+        let mut pool_events_rx = pool_events_rx;
+        while let Some(event) = pool_events_rx.recv().await {
+            match event {
+                lending_pools::PoolEvent::PoolCreated(pool_id) => {
+                    info!("🏦 Pool created: {}", pool_id);
+                }
+                lending_pools::PoolEvent::LoanCreated(loan_id, borrower) => {
+                    info!("💳 Loan created: {} for borrower {}", loan_id, borrower);
+                }
+                lending_pools::PoolEvent::LoanRepaid(loan_id, borrower) => {
+                    info!("✅ Loan repaid: {} by borrower {}", loan_id, borrower);
+                }
+                lending_pools::PoolEvent::LoanDefaulted(loan_id, borrower) => {
+                    warn!("⚠️ Loan defaulted: {} by borrower {}", loan_id, borrower);
+                }
+                lending_pools::PoolEvent::InterestPaid(loan_id, amount) => {
+                    debug!("💰 Interest paid: {} RON for loan {}", amount, loan_id);
+                }
+                lending_pools::PoolEvent::PoolLiquidated(pool_id) => {
+                    warn!("🚨 Pool liquidated: {}", pool_id);
+                }
+            }
+        }
+    });
+    info!("🏦 Pool event processing started");
+
     // Start task distributor processing
     let task_distributor_processing_handle = tokio::spawn(async move {
         let mut task_distributor_rx = task_distributor_rx;
@@ -782,6 +810,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stats_validation_service = Arc::clone(&validation_business_service);
     let stats_gpu_service = Arc::clone(&gpu_business_service);
     let stats_security_service = Arc::clone(&security_orchestration_service);
+    let stats_lending_pools_manager = Arc::clone(&lending_pools_manager);
 
     let stats_handle = tokio::spawn(async move {
         let mut stats_interval = tokio::time::interval(Duration::from_secs(600)); // 10 minutes
@@ -819,6 +848,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(security_stats) = stats_security_service.get_security_orchestration_stats().await {
                 info!("   🎭 Security: {} sessions, {} threats detected",
                     security_stats.total_sessions, security_stats.threats_detected);
+            }
+
+            // Collect lending pool statistics and analyze risk history
+            let pool_stats = stats_lending_pools_manager.get_stats().await;
+            info!("   🏦 Lending Pools: {} pools, {} loans, {} deposits, {:.2}% avg interest",
+                pool_stats.total_pools, pool_stats.total_loans, pool_stats.total_deposits, 
+                pool_stats.average_interest_rate * 100.0);
+            
+            // Use risk_history_snapshot to analyze risk outcomes (uses RiskRecord fields)
+            let risk_snapshot = stats_lending_pools_manager.risk_history_snapshot().await;
+            if !risk_snapshot.is_empty() {
+                let total_outcomes: usize = risk_snapshot.values().sum();
+                let repaid_count = risk_snapshot.get(&lending_pools::LoanOutcome::Repaid).copied().unwrap_or(0);
+                let defaulted_count = risk_snapshot.get(&lending_pools::LoanOutcome::Defaulted).copied().unwrap_or(0);
+                let liquidated_count = risk_snapshot.get(&lending_pools::LoanOutcome::Liquidated).copied().unwrap_or(0);
+                debug!("   📊 Risk History: {} total, {} repaid, {} defaulted, {} liquidated",
+                    total_outcomes, repaid_count, defaulted_count, liquidated_count);
             }
         }
     });
@@ -873,6 +919,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     info!("🏥 Service health monitoring started");
+
+    // Start periodic lending pool market operations
+    let market_lending_pools_manager = Arc::clone(&lending_pools_manager);
+    let market_handle = tokio::spawn(async move {
+        let mut market_interval = tokio::time::interval(Duration::from_secs(3600)); // 1 hour
+        loop {
+            market_interval.tick().await;
+
+            // Update market conditions periodically (uses MarketConditions fields)
+            let market_conditions = lending_pools::MarketConditions {
+                market_volatility: 0.5, // Would be calculated from real market data
+                liquidity_ratio: 1.0,
+                demand_supply_ratio: 1.0,
+                economic_indicators: HashMap::new(),
+                last_updated: SystemTime::now(),
+            };
+            market_lending_pools_manager.update_market_conditions(market_conditions).await;
+
+            // Calculate interest rates for different loan types (uses calculate_loan_interest_rate)
+            let loan_types = vec![
+                lending_pools::LoanType::Personal,
+                lending_pools::LoanType::Business,
+                lending_pools::LoanType::Crypto,
+            ];
+            for loan_type in &loan_types {
+                if let Ok(rate) = market_lending_pools_manager.calculate_loan_interest_rate(loan_type.clone(), 0.5).await {
+                    debug!("🏦 Market: {} loan rate: {:.2}%", format!("{:?}", loan_type), rate * 100.0);
+                }
+            }
+
+            // Apply rate adjustments based on market conditions (uses apply_rate_adjustment)
+            let adjustment = lending_pools::RateAdjustment {
+                adjustment_type: lending_pools::AdjustmentType::Freeze,
+                amount: 0.0,
+                reason: "Periodic market review".to_string(),
+                timestamp: SystemTime::now(),
+                market_conditions: lending_pools::MarketConditions {
+                    market_volatility: 0.5,
+                    liquidity_ratio: 1.0,
+                    demand_supply_ratio: 1.0,
+                    economic_indicators: HashMap::new(),
+                    last_updated: SystemTime::now(),
+                },
+            };
+            market_lending_pools_manager.apply_rate_adjustment(adjustment);
+
+            debug!("🏦 Market conditions updated");
+        }
+    });
+    info!("🏦 Market operations monitoring started");
 
     info!("💼 All business services running");
     info!("🌐 Mesh network operational");
