@@ -15,11 +15,13 @@ use crate::white_noise_crypto::WhiteNoiseEncryption;
 use crate::polymorphic_matrix::PolymorphicMatrix;
 use crate::mesh::BluetoothMeshManager;
 use crate::economic_engine::EconomicEngine;
+use crate::lending_pools::{LendingPoolManager, LoanStatus, LoanOutcome};
 use crate::services::secret_recipe_service::SecretRecipeService;
 use crate::services::polymorphic_matrix_service::PolymorphicMatrixService;
 use crate::services::engine_shell_service::EngineShellService;
 use crate::services::chaos_encryption_service::ChaosEncryptionService;
 use crate::services::anti_analysis_service::AntiAnalysisService;
+use crate::errors::{NexusError, utils};
 
 /// Security Orchestration Service for production-level coordination of the complete security stack
 pub struct SecurityOrchestrationService {
@@ -39,6 +41,7 @@ pub struct SecurityOrchestrationService {
     // Network and economic components
     mesh_manager: Arc<BluetoothMeshManager>,
     economic_engine: Arc<EconomicEngine>,
+    lending_pools_manager: Arc<LendingPoolManager>,
     
     // Orchestration state
     security_sessions: Arc<RwLock<HashMap<Uuid, SecuritySession>>>,
@@ -203,6 +206,7 @@ impl SecurityOrchestrationService {
         anti_analysis_service: Arc<AntiAnalysisService>,
         mesh_manager: Arc<BluetoothMeshManager>,
         economic_engine: Arc<EconomicEngine>,
+        lending_pools_manager: Arc<LendingPoolManager>,
     ) -> Self {
         let security_sessions = Arc::new(RwLock::new(HashMap::new()));
         let security_policies = Arc::new(RwLock::new(HashMap::new()));
@@ -221,6 +225,7 @@ impl SecurityOrchestrationService {
             anti_analysis_service,
             mesh_manager,
             economic_engine,
+            lending_pools_manager,
             security_sessions,
             security_policies,
             threat_level,
@@ -228,14 +233,29 @@ impl SecurityOrchestrationService {
         }
     }
 
-    /// Process comprehensive security orchestration
+    /// Process comprehensive security orchestration - integrates core components directly
     pub async fn process_security_orchestration(&self) -> Result<SecuritySession> {
-        // REAL BUSINESS LOGIC: Comprehensive security orchestration
+        // REAL BUSINESS LOGIC: Comprehensive security orchestration with direct core component integration
         let session_id = Uuid::new_v4();
         let session_type = SecuritySessionType::ThreatDetection;
         
-        // Detect current threat level
+        // Detect current threat level (now uses core components directly)
         let threat_level = self.detect_comprehensive_threat_level().await?;
+        
+        // REAL BUSINESS LOGIC: Pre-orchestration core component coordination
+        // Check core component health before starting orchestration
+        let secure_exec_status = self.secure_execution_engine.get_security_status().await;
+        let matrix_stats = {
+            let matrix = self.polymorphic_matrix.read().await;
+            matrix.get_statistics().clone()
+        };
+        let white_noise_stats = {
+            let white_noise = self.white_noise_encryption.read().await;
+            white_noise.get_encryption_stats().await
+        };
+        
+        tracing::debug!("Core component status - SecureExecution: {:?}, Matrix: {} recipes, WhiteNoise: {} encryptions",
+            secure_exec_status.overall_status, matrix_stats.unique_recipe_count, white_noise_stats.total_encryptions);
         
         // Create security session
         let mut session = SecuritySession {
@@ -277,8 +297,25 @@ impl SecurityOrchestrationService {
         // Orchestrate security services based on threat level
         self.orchestrate_security_services(&mut session).await?;
 
-        // Execute security actions with escalation support
+        // REAL BUSINESS LOGIC: Coordinate core components directly before executing actions
+        if matches!(session.threat_level, ThreatLevel::High | ThreatLevel::Critical | ThreatLevel::Emergency) {
+            // For high threat levels, coordinate core components directly
+            self.coordinate_core_components_for_threat(&session.threat_level).await?;
+        }
+
+        // Execute security actions with escalation support (now uses core components directly)
         self.execute_security_actions_with_escalation(&mut session).await?;
+        
+        // REAL BUSINESS LOGIC: Post-orchestration core component verification
+        let post_matrix_stats = {
+            let matrix = self.polymorphic_matrix.read().await;
+            matrix.get_statistics().clone()
+        };
+        
+        // Verify core components are in expected state
+        if post_matrix_stats.unique_recipe_count < matrix_stats.unique_recipe_count {
+            tracing::warn!("Polymorphic matrix recipe count decreased during orchestration");
+        }
         
         // Store session
         {
@@ -533,7 +570,7 @@ impl SecurityOrchestrationService {
     // Helper methods for orchestration logic
 
     async fn detect_comprehensive_threat_level(&self) -> Result<ThreatLevel> {
-        // REAL BUSINESS LOGIC: Detect threat level from all security services
+        // REAL BUSINESS LOGIC: Detect threat level from all security services AND core components
         let mut threat_indicators = 0;
         let mut total_checks = 0;
 
@@ -544,9 +581,45 @@ impl SecurityOrchestrationService {
         }
         total_checks += 1;
 
-        // Check secure execution engine
+        // Check secure execution engine (core component)
         let security_status = self.secure_execution_engine.get_security_status().await;
         if security_status.overall_status == SecurityLevel::Compromised {
+            threat_indicators += 1;
+        }
+        total_checks += 1;
+
+        // Check polymorphic matrix statistics (core component)
+        let matrix_stats = {
+            let matrix = self.polymorphic_matrix.read().await;
+            matrix.get_statistics().clone()
+        };
+        // Low recipe count or suspicious activity indicates potential compromise
+        if matrix_stats.unique_recipe_count == 0 && matrix_stats.total_packets_generated > 0 {
+            threat_indicators += 1;
+        }
+        total_checks += 1;
+
+        // Check white noise encryption stats (core component)
+        let white_noise_stats = {
+            let white_noise = self.white_noise_encryption.read().await;
+            white_noise.get_encryption_stats().await
+        };
+        // High encryption activity with low data encrypted indicates potential issues
+        if white_noise_stats.total_encryptions > 0 {
+            let data_per_encryption = white_noise_stats.total_data_encrypted as f64 / white_noise_stats.total_encryptions as f64;
+            if data_per_encryption < 100.0 {
+                threat_indicators += 1;
+            }
+            total_checks += 1;
+        }
+
+        // Check engine shell stats via core component inspection
+        let engine_shell_stats = {
+            let engine_shell = self.engine_shell_encryption.read().await;
+            engine_shell.get_shell_stats().await
+        };
+        // Check for suspicious shell activity - high anti-analysis triggers
+        if engine_shell_stats.anti_analysis_triggers > 0 {
             threat_indicators += 1;
         }
         total_checks += 1;
@@ -608,13 +681,15 @@ impl SecurityOrchestrationService {
         Ok(())
     }
 
+    /// Execute security actions - common implementation without retries/escalations
     async fn execute_security_actions(&self, session: &mut SecuritySession) -> Result<()> {
         // REAL BUSINESS LOGIC: Execute security actions
-        for (service_type, action) in session.active_services.iter().zip(session.security_actions.iter()) {
-            if let Err(e) = self.process_security_service_coordination(service_type.clone(), action.clone()).await {
-                tracing::error!("Failed to execute security action {:?} for service {:?}: {}", 
-                    action, service_type, e);
+        // Execute all actions, returning error if any fail
+        for action in &session.security_actions {
+            if let Err(e) = self.execute_single_security_action(action, session).await {
+                tracing::error!("Failed to execute security action {:?}: {}", action, e);
                 session.escalation_count += 1;
+                return Err(e);
             }
         }
 
@@ -865,6 +940,61 @@ impl SecurityOrchestrationService {
         }
     }
 
+    /// Coordinate core components directly for threat response
+    async fn coordinate_core_components_for_threat(&self, threat_level: &ThreatLevel) -> Result<()> {
+        // REAL BUSINESS LOGIC: Direct coordination of core components based on threat level
+        match threat_level {
+            ThreatLevel::High => {
+                // Rotate engine shell and cleanup matrix
+                {
+                    let mut engine_shell = self.engine_shell_encryption.write().await;
+                    engine_shell.rotate_shell_encryption().await?;
+                }
+                {
+                    let mut matrix = self.polymorphic_matrix.write().await;
+                    matrix.cleanup_expired_recipes();
+                }
+            }
+            ThreatLevel::Critical | ThreatLevel::Emergency => {
+                // Full coordination across all core components
+                
+                // Rotate engine shell
+                {
+                    let mut engine_shell = self.engine_shell_encryption.write().await;
+                    engine_shell.rotate_shell_encryption().await?;
+                }
+                
+                // Cleanup polymorphic matrix
+                {
+                    let mut matrix = self.polymorphic_matrix.write().await;
+                    matrix.cleanup_expired_recipes();
+                }
+                
+                // Update white noise to high intensity
+                let white_noise_config = crate::white_noise_crypto::WhiteNoiseConfig {
+                    noise_layer_count: 5,
+                    noise_intensity: 0.9,
+                    steganographic_enabled: true,
+                    chaos_seed: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos() as u64,
+                    encryption_algorithm: crate::white_noise_crypto::EncryptionAlgorithm::Hybrid,
+                    noise_pattern: crate::white_noise_crypto::NoisePattern::Chaotic,
+                };
+                
+                {
+                    let mut white_noise = self.white_noise_encryption.write().await;
+                    white_noise.update_config(white_noise_config).await?;
+                }
+                
+                tracing::info!("Coordinated all core components for {} threat level", format!("{:?}", threat_level));
+            }
+            _ => {
+                // Low/Medium threat - minimal coordination
+            }
+        }
+        
+        Ok(())
+    }
+
     /// Apply security policies to determine session configuration
     async fn apply_security_policies(&self, session: &mut SecuritySession) -> Result<()> {
         // REAL BUSINESS LOGIC: Apply matching security policies
@@ -903,20 +1033,30 @@ impl SecurityOrchestrationService {
         Ok(())
     }
 
-    /// Execute security actions with escalation rule support
+    /// Execute security actions with escalation rule support - wraps execute_security_actions with retries/escalations
     async fn execute_security_actions_with_escalation(&self, session: &mut SecuritySession) -> Result<()> {
         // REAL BUSINESS LOGIC: Execute actions with escalation support
-        for action in session.security_actions.clone() {
+        // Retry each action individually, wrapping the common execute_security_actions logic
+        let actions_to_execute = session.security_actions.clone();
+        
+        for action in actions_to_execute {
             let mut retry_count = 0;
             let max_retries = self.get_max_retries_for_action(&action, session).await;
 
             loop {
-                match self.execute_single_security_action(&action, session).await {
+                // Temporarily set session to only this action for the common implementation
+                let original_actions = std::mem::replace(&mut session.security_actions, vec![action.clone()]);
+                
+                match self.execute_security_actions(session).await {
                     Ok(_) => {
+                        // Restore original actions list before continuing
+                        session.security_actions = original_actions;
                         tracing::info!("Successfully executed security action {:?}", action);
                         break;
                     }
                     Err(e) => {
+                        // Restore original actions list before handling error
+                        session.security_actions = original_actions;
                         retry_count += 1;
                         session.retry_attempts.insert(action.clone(), retry_count);
 
@@ -926,14 +1066,29 @@ impl SecurityOrchestrationService {
                             break;
                         } else {
                             tracing::warn!("Security action {:?} failed, retrying ({}/{}): {}", action, retry_count, max_retries, e);
-                            tokio::time::sleep(Duration::from_millis(100 * retry_count as u64)).await;
+                            
+                            // Use error retry utilities for intelligent retry delays
+                            // Convert anyhow error to NexusError for retry delay calculation
+                            let nexus_error = NexusError::ServiceUnavailable { 
+                                service: format!("security_action_{:?}", action),
+                            };
+                            
+                            // Use retry delay utility if error is recoverable, otherwise use exponential backoff
+                            let delay = if utils::is_recoverable_error(&nexus_error) {
+                                utils::get_retry_delay(&nexus_error, retry_count)
+                                    .unwrap_or_else(|| Duration::from_millis(100 * retry_count as u64))
+                            } else {
+                                Duration::from_millis(100 * retry_count as u64)
+                            };
+                            
+                            tokio::time::sleep(delay).await;
                         }
                     }
                 }
             }
         }
 
-        // Check for escalation conditions
+        // Check for escalation conditions after all actions have been processed
         self.check_escalation_conditions(session).await?;
 
         Ok(())
@@ -984,43 +1139,213 @@ impl SecurityOrchestrationService {
         }
     }
 
-    /// Execute a single security action
+    /// Execute a single security action - integrates core components directly
     async fn execute_single_security_action(&self, action: &SecurityAction, session: &SecuritySession) -> Result<()> {
-        // REAL BUSINESS LOGIC: Execute individual security action
+        // REAL BUSINESS LOGIC: Execute individual security action with direct core component integration
         match action {
             SecurityAction::ActivateSecretRecipe => {
+                // Use service for complex recipe rotation logic
                 self.secret_recipe_service.process_routine_rotation().await?;
+                // Also update core polymorphic matrix directly for recipe cleanup
+                {
+                    let mut matrix = self.polymorphic_matrix.write().await;
+                    matrix.cleanup_expired_recipes();
+                }
             }
             SecurityAction::DeployPolymorphicMatrix => {
+                // Use BOTH core component directly AND service for comprehensive deployment
                 let data = vec![0u8; 1024];
+                
+                // Direct core component usage
+                let polymorphic_packet = {
+                    let mut matrix = self.polymorphic_matrix.write().await;
+                    matrix.generate_polymorphic_packet(&data, crate::polymorphic_matrix::PacketType::Paranoid).await?
+                };
+                
+                // Also use service for mesh/economic integration
                 self.polymorphic_matrix_service.process_polymorphic_packet_generation(
                     data, crate::polymorphic_matrix::PacketType::Paranoid
                 ).await?;
+                
+                tracing::debug!("Deployed polymorphic matrix directly (packet ID: {})", polymorphic_packet.recipe_id);
             }
             SecurityAction::EncryptEngineShell => {
+                // Use BOTH core component directly AND service for comprehensive encryption
                 let data = vec![0u8; 2048];
+                
+                // Direct core component usage
+                let encrypted_shell = {
+                    let mut engine_shell = self.engine_shell_encryption.write().await;
+                    engine_shell.encrypt_engine(&data).await?
+                };
+                
+                // Also use service for mesh/economic integration
                 self.engine_shell_service.process_engine_shell_encryption(data).await?;
+                
+                tracing::debug!("Encrypted engine shell directly (shell ID: {})", encrypted_shell.shell_id);
             }
             SecurityAction::InitiateChaosEncryption => {
+                // Use BOTH white noise core component directly AND chaos service
                 let data = vec![0u8; 512];
+                
+                // Direct core component usage - encrypt with white noise
+                let encryption_key = vec![0u8; 32]; // 256-bit key
+                let encrypted_data = {
+                    let mut white_noise = self.white_noise_encryption.write().await;
+                    white_noise.encrypt_data(&data, &encryption_key).await?
+                };
+                
+                // Also use chaos encryption service for additional processing
                 self.chaos_encryption_service.process_chaos_encryption(
                     data, crate::polymorphic_matrix::PacketType::Paranoid
                 ).await?;
+                
+                tracing::debug!("Initiated chaos encryption with white noise directly (encrypted size: {})", encrypted_data.encrypted_content.len());
+            }
+            SecurityAction::ApplyWhiteNoise => {
+                // REAL BUSINESS LOGIC: Use white noise encryption core component directly
+                let data = vec![0u8; 256];
+                let encryption_key = vec![0u8; 32]; // 256-bit key
+                
+                let encrypted_data = {
+                    let mut white_noise = self.white_noise_encryption.write().await;
+                    white_noise.encrypt_data(&data, &encryption_key).await?
+                };
+                
+                // Update statistics
+                let white_noise_stats = {
+                    let white_noise = self.white_noise_encryption.read().await;
+                    white_noise.get_encryption_stats().await
+                };
+                
+                tracing::info!("Applied white noise encryption directly - Stats: {} encryptions, {} bytes encrypted", 
+                    white_noise_stats.total_encryptions, white_noise_stats.total_data_encrypted);
             }
             SecurityAction::StartAntiAnalysis => {
+                // Use anti-analysis service for comprehensive detection
                 self.anti_analysis_service.process_comprehensive_detection().await?;
+                
+                // Also check engine shell anti-analysis directly
+                let engine_shell_stats = {
+                    let engine_shell = self.engine_shell_encryption.read().await;
+                    engine_shell.get_shell_stats().await
+                };
+                
+                if engine_shell_stats.anti_analysis_triggers > 0 {
+                    tracing::warn!("Engine shell detected {} anti-analysis triggers", engine_shell_stats.anti_analysis_triggers);
+                }
+            }
+            SecurityAction::RotateSecurityKeys => {
+                // REAL BUSINESS LOGIC: Rotate keys across core components
+                
+                // Rotate engine shell encryption
+                {
+                    let mut engine_shell = self.engine_shell_encryption.write().await;
+                    engine_shell.rotate_shell_encryption().await?;
+                }
+                
+                // Cleanup expired polymorphic matrix recipes (effectively rotating active keys)
+                {
+                    let mut matrix = self.polymorphic_matrix.write().await;
+                    matrix.cleanup_expired_recipes();
+                }
+                
+                // Update white noise config (key rotation effect)
+                let current_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos() as u64;
+                let white_noise_config = crate::white_noise_crypto::WhiteNoiseConfig {
+                    noise_layer_count: 3,
+                    noise_intensity: 0.7,
+                    steganographic_enabled: true,
+                    chaos_seed: current_time, // New seed = new key behavior
+                    encryption_algorithm: crate::white_noise_crypto::EncryptionAlgorithm::AES256GCM,
+                    noise_pattern: crate::white_noise_crypto::NoisePattern::Chaotic,
+                };
+                
+                {
+                    let mut white_noise = self.white_noise_encryption.write().await;
+                    white_noise.update_config(white_noise_config).await?;
+                }
+                
+                tracing::info!("Rotated security keys across all core components");
             }
             SecurityAction::DeployCountermeasures => {
+                // REAL BUSINESS LOGIC: Deploy countermeasures using core components
+                
+                // Rotate all encryption systems
+                {
+                    let mut engine_shell = self.engine_shell_encryption.write().await;
+                    engine_shell.rotate_shell_encryption().await?;
+                }
+                
+                {
+                    let mut matrix = self.polymorphic_matrix.write().await;
+                    matrix.cleanup_expired_recipes();
+                }
+                
                 // Update statistics for countermeasures
                 let mut stats = self.orchestration_stats.write().await;
                 stats.countermeasures_deployed += 1;
+                
+                tracing::info!("Deployed countermeasures across all core components");
+            }
+            SecurityAction::ExecuteSecureTask => {
+                // REAL BUSINESS LOGIC: Execute secure task through secure execution engine
+                let audit_result = self.secure_execution_engine.run_security_audit().await?;
+                
+                if audit_result.overall_score < 0.7 {
+                    tracing::warn!("Secure task execution detected low security score: {:.2}", audit_result.overall_score);
+                }
+            }
+            SecurityAction::EnterStealthMode => {
+                // REAL BUSINESS LOGIC: Enter stealth mode using all core components
+                
+                // Rotate engine shell
+                {
+                    let mut engine_shell = self.engine_shell_encryption.write().await;
+                    engine_shell.rotate_shell_encryption().await?;
+                }
+                
+                // Cleanup polymorphic matrix
+                {
+                    let mut matrix = self.polymorphic_matrix.write().await;
+                    matrix.cleanup_expired_recipes();
+                }
+                
+                // Update white noise to maximum intensity
+                let white_noise_config = crate::white_noise_crypto::WhiteNoiseConfig {
+                    noise_layer_count: 5,
+                    noise_intensity: 1.0, // Maximum intensity
+                    steganographic_enabled: true,
+                    chaos_seed: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos() as u64,
+                    encryption_algorithm: crate::white_noise_crypto::EncryptionAlgorithm::Hybrid,
+                    noise_pattern: crate::white_noise_crypto::NoisePattern::Chaotic,
+                };
+                
+                {
+                    let mut white_noise = self.white_noise_encryption.write().await;
+                    white_noise.update_config(white_noise_config).await?;
+                }
+                
+                tracing::info!("Entered stealth mode - all core components configured for maximum obfuscation");
             }
             SecurityAction::EscalateThreat => {
                 // Escalation is handled by escalation condition checking
                 tracing::warn!("Threat escalated for session {}", session.session_id);
             }
-            _ => {
-                tracing::warn!("Unhandled security action: {:?}", action);
+            SecurityAction::TriggerSelfDestruct => {
+                // REAL BUSINESS LOGIC: Critical self-destruct - use all core components
+                tracing::error!("SELF-DESTRUCT TRIGGERED for session {}", session.session_id);
+                
+                // Maximum obfuscation across all components
+                {
+                    let mut engine_shell = self.engine_shell_encryption.write().await;
+                    let _ = engine_shell.rotate_shell_encryption().await;
+                }
+                
+                {
+                    let mut matrix = self.polymorphic_matrix.write().await;
+                    matrix.cleanup_expired_recipes();
+                }
             }
         }
 
@@ -1248,6 +1573,75 @@ impl SecurityOrchestrationService {
         self.process_security_policy_management(standard_policy).await?;
 
         tracing::info!("Initialized {} default security policies", policies.len());
+        Ok(())
+    }
+
+    /// Monitor lending pool security threats and economic anomalies
+    pub async fn monitor_lending_pool_security(&self) -> Result<()> {
+        tracing::debug!("🔒 Security Service: Monitoring lending pool security threats");
+        
+        // Get all lending pools to monitor
+        let all_pools = self.lending_pools_manager.get_all_pools().await;
+        
+        for pool in all_pools.iter() {
+            // Check for high-risk pools that may indicate security threats
+            if pool.risk_score > 0.8 {
+                tracing::warn!("🔒 Security Service: High-risk lending pool detected: {} (risk score: {:.2})", 
+                    pool.pool_id, pool.risk_score);
+                
+                // Check for suspicious loan patterns
+                let active_loans = pool.active_loans.read().await;
+                let defaulted_count = active_loans.values()
+                    .filter(|loan| loan.status == LoanStatus::Defaulted || loan.status == LoanStatus::Liquidated)
+                    .count();
+                let total_loans = active_loans.len();
+                
+                if total_loans > 0 {
+                    let default_rate = defaulted_count as f64 / total_loans as f64;
+                    if default_rate > 0.3 {
+                        tracing::warn!("🔒 Security Service: Suspicious default rate detected in pool {}: {:.1}%", 
+                            pool.pool_id, default_rate * 100.0);
+                        
+                        // Record risk outcome for security monitoring
+                        for (loan_id, loan) in active_loans.iter() {
+                            if loan.status == LoanStatus::Defaulted {
+                                self.lending_pools_manager.record_risk_outcome(
+                                    loan_id.clone(),
+                                    LoanOutcome::Defaulted,
+                                    loan.risk_score
+                                ).await;
+                            }
+                        }
+                    }
+                }
+                
+                // Check for underwater loans that may indicate market manipulation
+                let underwater_count = active_loans.values()
+                    .filter(|loan| loan.collateral_ratio < 1.0 && loan.status == LoanStatus::Active)
+                    .count();
+                
+                if underwater_count > 0 {
+                    tracing::warn!("🔒 Security Service: {} underwater loans detected in pool {} - potential security threat", 
+                        underwater_count, pool.pool_id);
+                }
+            }
+            
+            // Check pool utilization for potential attacks
+            if pool.pool_utilization > 0.95 && pool.risk_score > 0.7 {
+                tracing::warn!("🔒 Security Service: Critical pool conditions detected: {} (utilization: {:.1}%, risk: {:.2})", 
+                    pool.pool_id, pool.pool_utilization * 100.0, pool.risk_score);
+            }
+        }
+        
+        // Get manager statistics for overall security assessment
+        let manager_stats = self.lending_pools_manager.get_stats().await;
+        if manager_stats.total_loans > 0 && manager_stats.total_pools > 0 {
+            let avg_loans_per_pool = manager_stats.total_loans as f64 / manager_stats.total_pools as f64;
+            if avg_loans_per_pool > 100.0 {
+                tracing::debug!("🔒 Security Service: High loan activity detected (avg {:.1} loans/pool)", avg_loans_per_pool);
+            }
+        }
+        
         Ok(())
     }
 }

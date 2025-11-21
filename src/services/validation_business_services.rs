@@ -9,11 +9,12 @@ use tracing;
 use std::collections::HashMap;
 
 use crate::mesh_validation::{MeshValidator, MeshTransaction, ValidationResult, TokenType};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use crate::task_distributor::TaskDistributor;
-use crate::validator::{ComputationTask, TaskType};
+use crate::validator::{ComputationTask, TaskType, TaskResult};
 use crate::mesh::BluetoothMeshManager;
 use crate::economic_engine::{EconomicEngine, NetworkStats};
+use crate::lending_pools::LendingPoolManager;
 use crate::contract_integration::{ContractIntegration, ContractTask};
 use crate::secure_execution::SecureExecutionEngine;
 
@@ -23,6 +24,7 @@ pub struct ValidationBusinessService {
     task_distributor: Arc<TaskDistributor>,
     mesh_manager: Arc<BluetoothMeshManager>,
     economic_engine: Arc<EconomicEngine>,
+    lending_pools_manager: Arc<LendingPoolManager>,
     contract_integration: Arc<ContractIntegration>,
     secure_execution_engine: Arc<SecureExecutionEngine>,
 }
@@ -34,6 +36,7 @@ impl ValidationBusinessService {
         task_distributor: Arc<TaskDistributor>,
         mesh_manager: Arc<BluetoothMeshManager>,
         economic_engine: Arc<EconomicEngine>,
+        lending_pools_manager: Arc<LendingPoolManager>,
         contract_integration: Arc<ContractIntegration>,
         secure_execution_engine: Arc<SecureExecutionEngine>,
     ) -> Self {
@@ -42,6 +45,7 @@ impl ValidationBusinessService {
             task_distributor,
             mesh_manager,
             economic_engine,
+            lending_pools_manager,
             contract_integration,
             secure_execution_engine,
         }
@@ -362,6 +366,106 @@ impl ValidationBusinessService {
 
         tracing::debug!("✅ Validation Service: Cached {} validation results", validation_cache.len());
         Ok(validation_cache)
+    }
+
+    /// Start the validator event loop to process computation tasks from mesh/P2P networks
+    /// This manages the legacy validator::start_validator function within the business service
+    /// Returns a handle that manages both the validator and bridge tasks
+    pub fn start_validator_event_loop(
+        &self,
+        task_rx: mpsc::Receiver<ComputationTask>,
+        result_tx: mpsc::Sender<TaskResult>,
+        p2p_result_tx: Option<mpsc::Sender<TaskResult>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tracing::info!("✅ Validation Service: Starting validator event loop");
+        
+        let result_tx_clone = result_tx.clone();
+        let p2p_result_tx_clone = p2p_result_tx.clone();
+        
+        // Create internal channel for validator results
+        let (internal_result_tx, mut internal_result_rx) = mpsc::channel::<TaskResult>(100);
+        
+        // Start the validator processing loop
+        let _validator_handle = tokio::spawn(crate::validator::start_validator(task_rx, internal_result_tx));
+        
+        // Bridge validator results to both mesh and optionally P2P
+        // This handle is returned and manages the validator lifecycle
+        tokio::spawn(async move {
+            while let Some(result) = internal_result_rx.recv().await {
+                tracing::debug!("✅ Validation Service: Broadcasting validator result: {:?}", result.task_id);
+                
+                // Send to mesh (original flow)
+                if let Err(e) = result_tx_clone.send(result.clone()).await {
+                    tracing::error!("✅ Validation Service: Failed to send result to mesh: {}", e);
+                }
+                
+                // Send to P2P if provided
+                if let Some(p2p_tx) = p2p_result_tx_clone.as_ref() {
+                    if let Err(e) = p2p_tx.send(result).await {
+                        tracing::error!("✅ Validation Service: Failed to send result to P2P: {}", e);
+                    }
+                }
+            }
+            
+            tracing::info!("✅ Validation Service: Validator event loop stopped");
+        })
+    }
+
+    /// Validate transaction with lending pool eligibility check
+    pub async fn validate_transaction_with_lending_pool(&self, mesh_transaction: MeshTransaction) -> Result<ValidationResult> {
+        tracing::debug!("✅ Validation Service: Validating transaction with lending pool eligibility check");
+        
+        // First perform standard validation
+        let validation_result = self.process_mesh_transaction_validation(mesh_transaction.clone()).await?;
+        
+        // If transaction is valid and qualifies for lending pool operations, check eligibility
+        if validation_result.is_valid && mesh_transaction.amount > 10000 {
+            // Check if transaction qualifies for lending pool operations
+            let all_pools = self.lending_pools_manager.get_all_pools().await;
+            
+            for pool in all_pools.iter() {
+                // Check if pool has capacity and acceptable risk
+                if pool.pool_utilization < 0.9 && pool.risk_score < 0.7 {
+                    // Check if transaction amount is within pool limits
+                    if mesh_transaction.amount <= pool.max_loan_size {
+                        tracing::debug!("✅ Validation Service: Transaction {} qualifies for lending pool {} (amount: {}, max: {})", 
+                            mesh_transaction.id, pool.pool_id, mesh_transaction.amount, pool.max_loan_size);
+                        
+                        // Transaction is validated and eligible for lending pool operations
+                        return Ok(validation_result);
+                    }
+                }
+            }
+        }
+        
+        Ok(validation_result)
+    }
+
+    /// Monitor lending pool activity for validation purposes
+    pub async fn monitor_lending_pool_for_validation(&self) -> Result<()> {
+        tracing::debug!("✅ Validation Service: Monitoring lending pool activity for validation");
+        
+        // Get lending pool statistics
+        let manager_stats = self.lending_pools_manager.get_stats().await;
+        
+        // Check if there are active loans that need validation monitoring
+        if manager_stats.total_loans > 0 {
+            let all_pools = self.lending_pools_manager.get_all_pools().await;
+            
+            for pool in all_pools.iter() {
+                let active_loans = pool.active_loans.read().await;
+                let pending_loans = active_loans.values()
+                    .filter(|loan| loan.status == crate::lending_pools::LoanStatus::Pending)
+                    .count();
+                
+                if pending_loans > 0 {
+                    tracing::debug!("✅ Validation Service: Pool {} has {} pending loans requiring validation", 
+                        pool.pool_id, pending_loans);
+                }
+            }
+        }
+        
+        Ok(())
     }
 }
 

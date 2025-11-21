@@ -96,6 +96,12 @@ pub enum IpcMessage {
         message: String,
         code: Option<u32>,
     },
+    /// Request for IPC server statistics (uptime, connection stats)
+    StatsRequest,
+    /// IPC server statistics response
+    StatsResponse {
+        stats: ConnectionStats,
+    },
 }
 
 /// Enhanced IPC events for full client communication
@@ -110,7 +116,7 @@ pub enum EnhancedIpcEvent {
 }
 
 /// Connection statistics for monitoring
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionStats {
     pub connected_clients: usize,
     pub total_messages_sent: u64,
@@ -174,9 +180,35 @@ impl Default for EngineStatus {
     }
 }
 
+/// Connection request for manually connecting to a peer
+#[derive(Debug, Clone)]
+pub struct ConnectionRequest {
+    pub peer_id: String,
+    pub address: Option<String>,
+    pub node_id: Option<String>,
+}
+
 /// Global engine status
 static ENGINE_STATUS: once_cell::sync::Lazy<Arc<RwLock<EngineStatus>>> =
     once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(EngineStatus::default())));
+
+/// Global connection request channel sender (set by main.rs)
+static CONNECTION_REQUEST_TX: once_cell::sync::Lazy<Arc<tokio::sync::Mutex<Option<mpsc::Sender<ConnectionRequest>>>>> =
+    once_cell::sync::Lazy::new(|| Arc::new(tokio::sync::Mutex::new(None)));
+
+/// Set the connection request channel sender (called by main.rs)
+pub async fn set_connection_request_tx(tx: mpsc::Sender<ConnectionRequest>) {
+    let mut guard = CONNECTION_REQUEST_TX.lock().await;
+    *guard = Some(tx);
+}
+
+/// Get the connection request channel sender (called by IPC handlers)
+fn get_connection_request_tx() -> Option<mpsc::Sender<ConnectionRequest>> {
+    // Note: This is a blocking call, but it should be fast since we're just cloning the Option
+    // In production, we might want to use a non-blocking approach
+    let guard = CONNECTION_REQUEST_TX.try_lock().ok()?;
+    guard.as_ref().map(|tx| tx.clone())
+}
 
 // Old basic IPC server removed - replaced by enhanced version below
 
@@ -429,26 +461,50 @@ async fn handle_command(command: serde_json::Value) -> String {
         "ConnectToDevice" => {
             tracing::info!("Connecting to Bluetooth device via IPC");
             if let Some(device_id) = command.get("device_id").and_then(|v| v.as_str()) {
-                let mut status = ENGINE_STATUS.write().await;
+                // Get optional address and node_id from command
+                let address = command.get("address").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let node_id = command.get("node_id").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-                // Add new peer to mesh
+                // Send connection request through global channel if available
+                if let Some(conn_tx) = get_connection_request_tx() {
+                    let request = ConnectionRequest {
+                        peer_id: device_id.to_string(),
+                        address,
+                        node_id,
+                    };
+                    if let Err(e) = conn_tx.try_send(request) {
+                        tracing::warn!("Failed to send connection request: {}", e);
+                        return json!({
+                            "type": "error",
+                            "message": format!("Failed to queue connection request: {}", e)
+                        }).to_string();
+                    }
+                    tracing::info!("Connection request queued for peer: {}", device_id);
+                } else {
+                    tracing::warn!("Connection request channel not available");
+                }
+
+                // Update status optimistically
+                let mut status = ENGINE_STATUS.write().await;
                 let new_peer = MeshPeerInfo {
                     id: device_id.to_string(),
-                    is_connected: true,
+                    is_connected: false, // Will be updated when connection succeeds
                     connection_quality: 0.88,
                     last_seen: chrono::Utc::now().to_rfc3339(),
                 };
 
-                status.mesh_peers.push(new_peer);
-                status.connected_peers = status.mesh_peers.len();
-                status.total_peers = status.mesh_peers.len();
+                // Only add if not already present
+                if !status.mesh_peers.iter().any(|p| p.id == device_id) {
+                    status.mesh_peers.push(new_peer);
+                    status.total_peers = status.mesh_peers.len();
+                }
 
                 json!({
-                    "type": "device_connected",
+                    "type": "device_connection_initiated",
                     "data": {
                         "device_id": device_id,
                         "success": true,
-                        "message": "Device connected to mesh"
+                        "message": "Connection request sent to mesh manager"
                     }
                 }).to_string()
             } else {
@@ -536,6 +592,10 @@ impl IpcServer {
                 let status = ENGINE_STATUS.read().await.clone();
                 Some(IpcMessage::StatusResponse { status })
             }
+            IpcMessage::StatsRequest => {
+                let stats = self.get_stats().await;
+                Some(IpcMessage::StatsResponse { stats })
+            }
             IpcMessage::Command { command, params } => {
                 let response = handle_command_enhanced(&command, params).await;
                 Some(response)
@@ -561,17 +621,24 @@ impl IpcServer {
         }
     }
 
-    /// Process command from enhanced IPC
-    pub async fn process_command(&self, command: IpcMessage) -> Result<(), Box<dyn std::error::Error>> {
+    /// Process command from enhanced IPC and return the response
+    pub async fn process_command(&self, command: IpcMessage) -> Result<IpcMessage, Box<dyn std::error::Error + Send + Sync>> {
         match command {
             IpcMessage::Command { command, params } => {
                 let response = handle_command_enhanced(&command, params).await;
                 tracing::debug!("Processed enhanced IPC command: {:?}", response);
-                Ok(())
+                
+                // Update stats for command processing
+                {
+                    let mut stats = self.stats.write().await;
+                    stats.total_messages_received += 1;
+                }
+                
+                Ok(response)
             }
             _ => {
                 tracing::warn!("Unknown command type in enhanced IPC: {:?}", command);
-                Ok(())
+                Err(format!("Unknown command type: {:?}", command).into())
             }
         }
     }
@@ -595,6 +662,14 @@ async fn handle_command_enhanced(command: &str, params: Option<serde_json::Value
         "status" | "GetStatus" => {
             let status = ENGINE_STATUS.read().await.clone();
             IpcMessage::StatusResponse { status }
+        }
+        "stats" | "GetStats" | "GetIpcStats" => {
+            // This will be handled by the server instance in process_message
+            // For backward compatibility, return an error directing to use StatsRequest
+            IpcMessage::Error {
+                message: "Use StatsRequest message type for IPC statistics".to_string(),
+                code: Some(400),
+            }
         }
         "ResumeEngine" => {
             {
@@ -705,6 +780,12 @@ async fn handle_connection(stream: TcpStream, server: Arc<IpcServer>, event_tx: 
     let initial_message = IpcMessage::StatusResponse { status };
     let message_text = serde_json::to_string(&initial_message)?;
     ws_sender.send(Message::Text(message_text)).await?;
+    
+    // Update stats for initial message sent
+    {
+        let mut stats = server.stats.write().await;
+        stats.total_messages_sent += 1;
+    }
 
     // Handle incoming messages
     while let Some(msg_result) = ws_receiver.next().await {
@@ -712,15 +793,57 @@ async fn handle_connection(stream: TcpStream, server: Arc<IpcServer>, event_tx: 
             Ok(Message::Text(text)) => {
                 // Try to parse as IpcMessage first
                 if let Ok(ipc_message) = serde_json::from_str::<IpcMessage>(&text) {
-                    if let Some(response) = server.process_message(ipc_message).await {
-                        let response_text = serde_json::to_string(&response)?;
-                        ws_sender.send(Message::Text(response_text)).await?;
+                    // Track command received for telemetry
+                    if matches!(ipc_message, IpcMessage::Command { .. }) {
+                        let _ = event_tx.send(EnhancedIpcEvent::CommandReceived(ipc_message.clone())).await;
+                        
+                        // Use process_command for Command messages (better error handling and stats)
+                        match server.process_command(ipc_message).await {
+                            Ok(response) => {
+                                let response_text = serde_json::to_string(&response)?;
+                                ws_sender.send(Message::Text(response_text)).await?;
+                                
+                                // Update stats for sent messages
+                                {
+                                    let mut stats = server.stats.write().await;
+                                    stats.total_messages_sent += 1;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to process command: {}", e);
+                                let error_response = IpcMessage::Error {
+                                    message: format!("Command processing failed: {}", e),
+                                    code: Some(500),
+                                };
+                                let response_text = serde_json::to_string(&error_response)?;
+                                let _ = ws_sender.send(Message::Text(response_text)).await;
+                            }
+                        }
+                    } else {
+                        // Use process_message for non-command messages
+                        if let Some(response) = server.process_message(ipc_message).await {
+                            let response_text = serde_json::to_string(&response)?;
+                            ws_sender.send(Message::Text(response_text)).await?;
+                            
+                            // Update stats for sent messages
+                            {
+                                let mut stats = server.stats.write().await;
+                                stats.total_messages_sent += 1;
+                            }
+                        }
                     }
                 } else {
                     // Fall back to legacy command handling
                     let response = handle_command_enhanced(&text, None).await;
                     let response_text = serde_json::to_string(&response)?;
                     ws_sender.send(Message::Text(response_text)).await?;
+                    
+                    // Update stats for sent messages
+                    {
+                        let mut stats = server.stats.write().await;
+                        stats.total_messages_sent += 1;
+                        stats.total_messages_received += 1;
+                    }
                 }
             }
             Ok(Message::Ping(data)) => {

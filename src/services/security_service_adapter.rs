@@ -34,6 +34,9 @@ impl Service for SecurityServiceAdapter {
         // Periodic orchestration
         let _ = self.inner.process_security_orchestration().await?;
 
+        // Monitor lending pool security threats
+        let _ = self.inner.monitor_lending_pool_security().await;
+
         // Every N ticks, run an audit as well
         {
             let mut c = self.counter.write().await;

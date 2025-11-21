@@ -32,6 +32,7 @@ pub mod aura_protocol;
 pub mod transaction_queue;
 pub mod sync;
 pub mod mesh_validation;
+pub mod services;
 
 // Re-export public APIs for external use
 pub use config::*;

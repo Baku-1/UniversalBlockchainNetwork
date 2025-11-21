@@ -381,6 +381,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&anti_analysis_service),
         Arc::clone(&mesh_manager),
         Arc::clone(&economic_engine),
+        Arc::clone(&lending_pools_manager),
     ));
     info!("🎭 Security Orchestration Service initialized");
 
@@ -422,6 +423,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&task_distributor),
         Arc::clone(&mesh_manager),
         Arc::clone(&economic_engine),
+        Arc::clone(&lending_pools_manager),
         Arc::clone(&contract_integration),
         Arc::clone(&secure_execution_engine),
     ));
@@ -567,6 +569,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         p2p_status_tx,
     ));
     info!("� P2P networking started");
+
+    // Create connection request channel for IPC to trigger peer connections
+    let (connection_request_tx, mut connection_request_rx) = mpsc::channel(100);
+    ipc::set_connection_request_tx(connection_request_tx).await;
+    info!("Connection request channel initialized");
+
+    // Start connection request handler
+    let mesh_manager_for_connections = Arc::clone(&mesh_manager);
+    let connection_request_handle = tokio::spawn(async move {
+        while let Some(request) = connection_request_rx.recv().await {
+            info!("Connection request received for peer: {}", request.peer_id);
+            match mesh_manager_for_connections.manually_discover_peer(
+                request.peer_id.clone(),
+                request.address,
+                request.node_id,
+            ).await {
+                Ok(()) => {
+                    info!("Successfully initiated connection to peer: {}", request.peer_id);
+                }
+                Err(e) => {
+                    warn!("Failed to connect to peer {}: {}", request.peer_id, e);
+                }
+            }
+        }
+    });
+    info!("Connection request handler started");
 
     // Start IPC server for external client communication
     let ipc_events_rx = ipc::start_ipc_server(app_config.ipc_port).await?;
@@ -862,6 +890,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     validator_handle.abort();
     validator_bridge_handle.abort();
     p2p_handle.abort();
+    connection_request_handle.abort();
     ipc_events_handle.abort();
     p2p_status_handle.abort();
     queue_processing_handle.abort();

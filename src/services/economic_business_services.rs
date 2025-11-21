@@ -160,8 +160,9 @@ impl EconomicBusinessService {
         if let Some(lending_manager) = self.economic_engine.get_lending_pools_manager().await {
             let manager_stats = lending_manager.get_stats().await;
 
-            tracing::info!("💰 Economic Service: Economic stats - Pools: {}, Active Loans: {}, Deposits: {} RON",
-                economic_stats.pool_count, economic_stats.total_active_loans, economic_stats.total_pool_deposits);
+            let deposits_ron = crate::web3::utils::wei_to_ron(economic_stats.total_pool_deposits);
+            tracing::info!("💰 Economic Service: Economic stats - Pools: {}, Active Loans: {}, Deposits: {:.6} RON ({} wei)",
+                economic_stats.pool_count, economic_stats.total_active_loans, deposits_ron, economic_stats.total_pool_deposits);
 
             // Monitor pool activity
             if manager_stats.total_loans > manager_stats.total_pools * 2 {
@@ -252,7 +253,8 @@ impl EconomicBusinessService {
                         term_days,
                         interest_rate
                     ).await {
-                        tracing::info!("💳 Economic Service: Created loan in pool: {} for {} RON", loan_id_created, loan_amount);
+                        let loan_amount_ron = crate::web3::utils::wei_to_ron(loan_amount);
+                        tracing::info!("💳 Economic Service: Created loan in pool: {} for {:.6} RON ({} wei)", loan_id_created, loan_amount_ron, loan_amount);
 
                         // DIRECT LENDING POOL ACCESS: Get pool stats using unused method
                         let pool_stats = pool_details.get_pool_stats().await;
@@ -419,7 +421,8 @@ impl EconomicBusinessService {
                                 if let Err(e) = self.economic_engine.record_loan_repaid(loan_id.clone(), loan_details.borrower_address.clone()).await {
                                     tracing::warn!("💰 Economic Service: Failed to record loan repayment: {}", e);
                                 } else {
-                                    tracing::debug!("💰 Economic Service: Recorded loan repayment for {}: {} RON", loan_id, repayment_amount);
+                                    let repayment_ron = crate::web3::utils::wei_to_ron(repayment_amount);
+                                    tracing::debug!("💰 Economic Service: Recorded loan repayment for {}: {:.6} RON ({} wei)", loan_id, repayment_ron, repayment_amount);
                                 }
                             }
                         }
@@ -454,7 +457,8 @@ impl EconomicBusinessService {
             if let Err(e) = self.economic_engine.record_incentive_earned(*amount).await {
                 tracing::warn!("Failed to record computing reward for {}: {}", participant, e);
             } else {
-                tracing::info!("💳 Economic Service: Distributed {} RON computing reward to participant {}", amount, participant);
+                let amount_ron = crate::web3::utils::wei_to_ron(*amount);
+                tracing::info!("💳 Economic Service: Distributed {:.6} RON ({} wei) computing reward to participant {}", amount_ron, amount, participant);
             }
         }
         
@@ -658,7 +662,10 @@ impl EconomicBusinessService {
             (network_stats.average_transaction_value * 2).max(1000) as u64 // Dynamic amount based on network activity, minimum 1000
         };
 
-        tracing::debug!("💰 Economic Service: Decoded transaction amount from data: {} RON", transaction_amount);
+        // Convert wei to RON for human-readable logging
+        let transaction_amount_ron = crate::web3::utils::wei_to_ron(transaction_amount);
+        tracing::debug!("💰 Economic Service: Decoded transaction amount from data: {:.6} RON ({} wei)", 
+            transaction_amount_ron, transaction_amount);
         
         // REAL BUSINESS LOGIC: Create mesh transaction for bridge processing
         let mesh_transaction = crate::mesh_validation::MeshTransaction {

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::NodeKeypair;
 use crate::config::RoninConfig;
-use crate::errors::NexusError;
+use crate::errors::{NexusError, Result};
 use crate::web3::RoninClient;
 
 /// Task status enum matching the contract
@@ -84,7 +84,7 @@ impl ContractIntegration {
     }
 
     /// Start the contract integration service
-    pub async fn start(&self) -> Result<(), NexusError> {
+    pub async fn start(&self) -> Result<()> {
         tracing::info!("Starting AuraProtocol contract integration");
         
         // Start task monitoring
@@ -98,7 +98,7 @@ impl ContractIntegration {
     }
 
     /// Monitor for new tasks from the contract
-    async fn start_task_monitoring(&self) -> Result<(), NexusError> {
+    async fn start_task_monitoring(&self) -> Result<()> {
         // Implement contract event monitoring
         // This would listen for TaskCreated events from the AuraProtocol contract
         tracing::info!("Started task monitoring for contract: {}", self.contract_address);
@@ -141,7 +141,7 @@ impl ContractIntegration {
     }
 
     /// Monitor for result submissions
-    async fn start_result_monitoring(&self) -> Result<(), NexusError> {
+    async fn start_result_monitoring(&self) -> Result<()> {
         // Implement result submission monitoring
         // This would handle submitting results back to the contract
         tracing::info!("Started result monitoring");
@@ -219,7 +219,7 @@ impl ContractIntegration {
     }
 
     /// Fetch active tasks from the contract
-    pub async fn fetch_active_tasks(&self) -> Result<Vec<ContractTask>, NexusError> {
+    pub async fn fetch_active_tasks(&self) -> Result<Vec<ContractTask>> {
         // Implement contract call to fetch tasks
         // This would call the contract's view functions to get task data
         tracing::debug!("Fetching active tasks from contract");
@@ -274,7 +274,7 @@ impl ContractIntegration {
     }
 
     /// Submit a task result to the contract
-    pub async fn submit_task_result(&self, result: TaskResult) -> Result<String, NexusError> {
+    pub async fn submit_task_result(&self, result: TaskResult) -> Result<String> {
         tracing::info!("Submitting result for task {}", result.task_id);
         
         // Use a match to handle success/failure and track statistics
@@ -336,7 +336,7 @@ impl ContractIntegration {
     }
 
     /// Validate a task result before submission
-    async fn validate_task_result(&self, result: &TaskResult) -> Result<(), NexusError> {
+    async fn validate_task_result(&self, result: &TaskResult) -> Result<()> {
         // Check if task exists
         let tasks = self.active_tasks.read().await;
         let task = tasks.get(&result.task_id)
@@ -383,7 +383,7 @@ impl ContractIntegration {
     }
 
     /// Add a new task from contract events
-    pub async fn add_task(&self, task: ContractTask) -> Result<(), NexusError> {
+    pub async fn add_task(&self, task: ContractTask) -> Result<()> {
         tracing::info!("Adding new task {} from contract", task.id);
         
         let mut tasks = self.active_tasks.write().await;
@@ -396,7 +396,7 @@ impl ContractIntegration {
     }
 
     /// Update task status
-    pub async fn update_task_status(&self, task_id: u64, status: TaskStatus) -> Result<(), NexusError> {
+    pub async fn update_task_status(&self, task_id: u64, status: TaskStatus) -> Result<()> {
         let mut tasks = self.active_tasks.write().await;
         if let Some(task) = tasks.get_mut(&task_id) {
             task.status = status;
@@ -418,7 +418,7 @@ impl ContractIntegration {
     }
 
     /// Store a pending result for later submission
-    pub async fn store_pending_result(&self, result: TaskResult) -> Result<(), NexusError> {
+    pub async fn store_pending_result(&self, result: TaskResult) -> Result<()> {
         let mut pending = self.pending_results.write().await;
         pending.insert(result.task_id, result);
         Ok(())
@@ -431,7 +431,7 @@ impl ContractIntegration {
     }
 
     /// Remove completed result
-    pub async fn remove_pending_result(&self, task_id: u64) -> Result<(), NexusError> {
+    pub async fn remove_pending_result(&self, task_id: u64) -> Result<()> {
         let mut pending = self.pending_results.write().await;
         pending.remove(&task_id);
         Ok(())
@@ -484,14 +484,14 @@ impl ContractIntegration {
     }
 
     /// Check contract connectivity using the Ronin client
-    pub async fn check_contract_connectivity(&self) -> Result<bool, NexusError> {
+    pub async fn check_contract_connectivity(&self) -> Result<bool> {
         let client = self.get_ronin_client();
         let is_connected = client.check_connectivity().await;
         Ok(is_connected)
     }
 
     /// Get current gas price for contract operations
-    pub async fn get_current_gas_price(&self) -> Result<u64, NexusError> {
+    pub async fn get_current_gas_price(&self) -> Result<u64> {
         let client = self.get_ronin_client();
         let gas_price = client.get_gas_price().await
             .map_err(|e| NexusError::NetworkConnection(format!("Failed to get gas price: {}", e)))?;
@@ -499,7 +499,7 @@ impl ContractIntegration {
     }
 
     /// Get current block number for contract monitoring
-    pub async fn get_current_block_number(&self) -> Result<u64, NexusError> {
+    pub async fn get_current_block_number(&self) -> Result<u64> {
         let client = self.get_ronin_client();
         let block_number = client.get_block_number().await
             .map_err(|e| NexusError::NetworkConnection(format!("Failed to get block number: {}", e)))?;

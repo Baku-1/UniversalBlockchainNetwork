@@ -174,9 +174,10 @@ impl RoninClient {
         // This is a read-only implementation for the utility application
         // In a real game, developers would integrate their own signing mechanism
         
-        // Log transaction request details for debugging
-        tracing::debug!("Transaction request prepared - From: {}, To: {}, Value: {}, Gas: {}", 
-            from_addr, to_addr, tx.value, tx.gas_limit);
+        // Log transaction request details for debugging (convert wei to RON for readability)
+        let value_ron = crate::web3::utils::wei_to_ron(tx.value);
+        tracing::debug!("Transaction request prepared - From: {}, To: {}, Value: {} RON ({} wei), Gas: {}", 
+            from_addr, to_addr, value_ron, tx.value, tx.gas_limit);
         tracing::debug!("Transaction request data size: {} bytes", tx_request.data.as_ref().map(|d| d.len()).unwrap_or(0));
 
         // For now, we'll simulate the transaction hash generation

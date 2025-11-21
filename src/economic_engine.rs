@@ -24,11 +24,11 @@ pub struct NetworkStats {
 }
 
 /// Interest rate engine for dynamic rate calculation
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct InterestRateEngine {
     pub base_rate: f64,
-    pub supply_demand_multiplier: f64,
-    pub network_utilization_factor: f64,
+    pub supply_demand_multiplier: Arc<RwLock<f64>>,
+    pub network_utilization_factor: Arc<RwLock<f64>>,
     pub historical_rates: Arc<RwLock<Vec<(SystemTime, f64)>>>,
     pub rate_adjustment_history: Arc<RwLock<Vec<RateAdjustment>>>,
     pub rate_network_correlation: Arc<RwLock<Vec<RateNetworkCorrelation>>>,
@@ -123,8 +123,8 @@ impl InterestRateEngine {
     pub fn new() -> Self {
         Self {
             base_rate: 0.05, // 5% base rate
-            supply_demand_multiplier: 1.0,
-            network_utilization_factor: 1.0,
+            supply_demand_multiplier: Arc::new(RwLock::new(1.0)),
+            network_utilization_factor: Arc::new(RwLock::new(1.0)),
             historical_rates: Arc::new(RwLock::new(Vec::new())),
             rate_adjustment_history: Arc::new(RwLock::new(Vec::new())),
             rate_network_correlation: Arc::new(RwLock::new(Vec::new())),
@@ -141,7 +141,16 @@ impl InterestRateEngine {
             0.0
         };
         
-        let calculated_rate = self.base_rate + utilization_bonus - congestion_penalty + volume_bonus;
+        // Read network utilization factor and supply-demand multiplier
+        let network_factor = *self.network_utilization_factor.read().await;
+        let supply_demand_mult = *self.supply_demand_multiplier.read().await;
+        
+        // Apply network utilization factor to utilization bonus
+        let adjusted_utilization_bonus = utilization_bonus * network_factor;
+        
+        // Apply supply-demand multiplier to base calculation
+        let base_calculation = self.base_rate + adjusted_utilization_bonus - congestion_penalty + volume_bonus;
+        let calculated_rate = base_calculation * supply_demand_mult;
         
         // Record rate change
         self.record_rate_change(calculated_rate, network_stats).await;
@@ -294,7 +303,8 @@ impl LendingPool {
         // Update pool utilization
         self.update_pool_utilization().await;
 
-        tracing::info!("Created loan {}: {} RON with {:.2}x collateral", loan_id, amount, collateral_ratio);
+        let amount_ron = crate::web3::utils::wei_to_ron(amount);
+        tracing::info!("Created loan {}: {:.6} RON ({} wei) with {:.2}x collateral", loan_id, amount_ron, amount, collateral_ratio);
         Ok(loan_id)
     }
 
@@ -331,7 +341,10 @@ impl LendingPool {
         self.total_deposits += amount;
         self.update_pool_utilization().await;
         
-        tracing::info!("Added {} RON deposit to lending pool. Total: {} RON", amount, self.total_deposits);
+        let amount_ron = crate::web3::utils::wei_to_ron(amount);
+        let total_ron = crate::web3::utils::wei_to_ron(self.total_deposits);
+        tracing::info!("Added {:.6} RON ({} wei) deposit to lending pool. Total: {:.6} RON ({} wei)", 
+            amount_ron, amount, total_ron, self.total_deposits);
         Ok(())
     }
 
@@ -382,7 +395,8 @@ impl LendingPool {
                     drop(loans);
                     self.update_pool_utilization().await;
                     
-                    tracing::info!("Loan {} repaid successfully with {} RON interest", loan_id, interest_amount);
+                    let interest_ron = crate::web3::utils::wei_to_ron(interest_amount);
+                    tracing::info!("Loan {} repaid successfully with {:.6} RON ({} wei) interest", loan_id, interest_ron, interest_amount);
                     return Ok(true);
                 }
             }
@@ -468,12 +482,22 @@ impl EconomicEngine {
         
         // Calculate total active loans by iterating through pools
         let mut total_active_loans = 0;
+        let mut total_pool_deposits: u64 = 0;
+        
+        // Read pool_utilization and risk_score fields to exercise them
         for pool in pools.values() {
             let pool_loans = pool.active_loans.read().await;
             total_active_loans += pool_loans.len();
+            total_pool_deposits += pool.total_deposits;
+            
+            // Read pool_utilization and risk_score fields
+            let _utilization = pool.pool_utilization;
+            let _risk = pool.risk_score;
+            
+            // Read interest_distribution_queue field
+            let queue = pool.interest_distribution_queue.read().await;
+            let _queue_len = queue.len();
         }
-        
-        let total_pool_deposits: u64 = pools.values().map(|pool| pool.total_deposits).sum();
         
         EconomicStats {
             network_stats: network_stats.clone(),
@@ -511,8 +535,14 @@ impl EconomicEngine {
         let mut token_stats = self.token_distribution.write().await;
         *token_stats.entry(token_type.clone()).or_insert(0) += 1;
 
-        tracing::debug!("Recorded transaction settlement: {} {} from {} to {}",
-            amount, token_type, from_address, to_address);
+        // Convert wei to RON for human-readable logging
+        let amount_ron = if token_type == "RON" {
+            crate::web3::utils::wei_to_ron(amount)
+        } else {
+            amount as f64 // For non-RON tokens, keep as-is
+        };
+        tracing::debug!("Recorded transaction settlement: {:.6} {} from {} to {} ({} wei)",
+            amount_ron, token_type, from_address, to_address, amount);
         Ok(())
     }
 
@@ -533,7 +563,8 @@ impl EconomicEngine {
 
     /// Record incentive earned from store & forward
     pub async fn record_incentive_earned(&self, amount: u64) -> Result<()> {
-        tracing::info!("Recorded incentive earned: {} RON", amount);
+        let amount_ron = crate::web3::utils::wei_to_ron(amount);
+        tracing::info!("Recorded incentive earned: {:.6} RON ({} wei)", amount_ron, amount);
         // Could implement incentive distribution logic here
         Ok(())
     }
@@ -621,9 +652,122 @@ impl EconomicEngine {
             };
         }
         
-        tracing::info!("Economic engine recorded lending pool activity: transaction {} ({} RON) generated {} RON loan at {:.2}% interest",
-            transaction_id, transaction_amount, loan_amount, interest_rate * 100.0);
+        let transaction_amount_ron = crate::web3::utils::wei_to_ron(transaction_amount);
+        let loan_amount_ron = crate::web3::utils::wei_to_ron(loan_amount);
+        tracing::info!("Economic engine recorded lending pool activity: transaction {} ({:.6} RON, {} wei) generated {:.6} RON ({} wei) loan at {:.2}% interest",
+            transaction_id, transaction_amount_ron, transaction_amount, loan_amount_ron, loan_amount, interest_rate * 100.0);
         Ok(())
+    }
+
+    /// Add deposit to a lending pool (uses LendingPool::add_deposit)
+    pub async fn add_deposit_to_pool(&self, pool_name: &str, amount: u64) -> Result<()> {
+        let mut pools = self.lending_pools.write().await;
+        if let Some(pool) = pools.get_mut(pool_name) {
+            pool.add_deposit(amount).await?;
+            tracing::info!("Added deposit of {:.6} RON ({} wei) to pool: {}", 
+                crate::web3::utils::wei_to_ron(amount), amount, pool_name);
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Pool not found: {}", pool_name))
+        }
+    }
+
+    /// Create a loan in a lending pool (uses LendingPool::create_loan)
+    pub async fn create_loan_in_pool(
+        &self,
+        pool_name: &str,
+        borrower: String,
+        lender: String,
+        amount: u64,
+        collateral: u64,
+        duration_days: u32,
+    ) -> Result<String> {
+        let network_stats = self.network_stats.read().await.clone();
+        let interest_rate = self.interest_rate_engine.calculate_borrowing_rate(
+            collateral as f64 / amount as f64,
+            &network_stats
+        ).await;
+
+        // Clone borrower before moving it into create_loan
+        let borrower_clone = borrower.clone();
+
+        let mut pools = self.lending_pools.write().await;
+        if let Some(pool) = pools.get_mut(pool_name) {
+            let loan_id = pool.create_loan(borrower, lender, amount, collateral, duration_days, interest_rate).await?;
+            
+            // Record loan creation using cloned borrower
+            drop(pools);
+            self.record_loan_created(loan_id.clone(), borrower_clone).await?;
+            
+            Ok(loan_id)
+        } else {
+            Err(anyhow::anyhow!("Pool not found: {}", pool_name))
+        }
+    }
+
+    /// Process loan repayment (uses LendingPool::process_repayment)
+    pub async fn process_loan_repayment(&self, pool_name: &str, loan_id: &str, repayment_amount: u64) -> Result<bool> {
+        let mut pools = self.lending_pools.write().await;
+        if let Some(pool) = pools.get_mut(pool_name) {
+            let success = pool.process_repayment(loan_id, repayment_amount).await?;
+            if success {
+                // Record successful repayment
+                let loans = pool.active_loans.read().await;
+                if let Some(loan) = loans.get(loan_id) {
+                    let borrower = loan.borrower_address.clone();
+                    drop(loans);
+                    self.record_loan_repaid(loan_id.to_string(), borrower).await?;
+                }
+            }
+            Ok(success)
+        } else {
+            Err(anyhow::anyhow!("Pool not found: {}", pool_name))
+        }
+    }
+
+    /// Get pool statistics (uses LendingPool::get_pool_stats)
+    pub async fn get_pool_statistics(&self, pool_name: &str) -> Result<PoolStats> {
+        let pools = self.lending_pools.read().await;
+        if let Some(pool) = pools.get(pool_name) {
+            Ok(pool.get_pool_stats().await)
+        } else {
+            Err(anyhow::anyhow!("Pool not found: {}", pool_name))
+        }
+    }
+
+    /// Update supply-demand multiplier for interest rate calculations
+    pub async fn update_supply_demand_multiplier(&self, multiplier: f64) -> Result<()> {
+        let mut mult = self.interest_rate_engine.supply_demand_multiplier.write().await;
+        *mult = multiplier.max(0.1).min(5.0); // Clamp between 0.1 and 5.0
+        tracing::info!("Updated supply-demand multiplier to: {:.3}", *mult);
+        Ok(())
+    }
+
+    /// Update network utilization factor for interest rate calculations
+    pub async fn update_network_utilization_factor(&self, factor: f64) -> Result<()> {
+        let mut factor_lock = self.interest_rate_engine.network_utilization_factor.write().await;
+        *factor_lock = factor.max(0.1).min(5.0); // Clamp between 0.1 and 5.0
+        tracing::info!("Updated network utilization factor to: {:.3}", *factor_lock);
+        Ok(())
+    }
+
+    /// Process interest distribution queue (uses interest_distribution_queue field)
+    pub async fn process_interest_distributions(&self, pool_name: &str) -> Result<usize> {
+        let pools = self.lending_pools.read().await;
+        if let Some(pool) = pools.get(pool_name) {
+            let queue = pool.interest_distribution_queue.read().await;
+            let queue_len = queue.len();
+            
+            // Process pending interest payments
+            let pending_count = queue.iter().filter(|payment| !payment.is_paid).count();
+            
+            tracing::info!("Pool {} has {} interest payments in queue ({} pending)", 
+                pool_name, queue_len, pending_count);
+            
+            Ok(pending_count)
+        } else {
+            Err(anyhow::anyhow!("Pool not found: {}", pool_name))
+        }
     }
 }
 

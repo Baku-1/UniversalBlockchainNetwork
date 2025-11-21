@@ -400,6 +400,23 @@
                                             name: `Peer ${peer.id.substring(0, 8)}`
                                         })));
                                     }
+                                } else if (data.type === 'device_connection_initiated' || data.type === 'device_connected') {
+                                    // Handle connection response
+                                    const deviceId = data.data?.device_id;
+                                    if (deviceId) {
+                                        console.log('Device connection initiated:', deviceId);
+                                        setNearbyDevices(prev => prev.map(device => 
+                                            device.id === deviceId 
+                                                ? { ...device, connected: true }
+                                                : device
+                                        ));
+                                        // Refresh status to get updated peer count
+                                        if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+                                            ws.current.send(JSON.stringify({ command: 'GetFullStatus' }));
+                                        }
+                                    }
+                                } else if (data.type === 'error') {
+                                    console.error('IPC Error:', data.message);
                                 }
                             } catch (error) {
                                 console.error('Error parsing WebSocket message:', error);
@@ -487,6 +504,31 @@
                 if (ws.current && ws.current.readyState === WebSocket.OPEN) {
                     const command = newRunningState ? 'StartEngine' : 'StopEngine';
                     ws.current.send(JSON.stringify({ command }));
+                }
+            };
+
+            const handleConnectToDevice = (deviceId) => {
+                if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+                    console.log('Connecting to device:', deviceId);
+                    ws.current.send(JSON.stringify({
+                        command: 'ConnectToDevice',
+                        device_id: deviceId
+                    }));
+                } else {
+                    console.error('WebSocket not connected');
+                }
+            };
+
+            const handleScanForDevices = () => {
+                if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+                    console.log('Scanning for devices...');
+                    ws.current.send(JSON.stringify({ command: 'ScanForDevices' }));
+                    // Refresh status after a short delay to get discovered devices
+                    setTimeout(() => {
+                        if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+                            ws.current.send(JSON.stringify({ command: 'GetFullStatus' }));
+                        }
+                    }, 2000);
                 }
             };
 
@@ -580,18 +622,41 @@
                                         </div>
 
                                         <div className="space-y-3">
-                                            <h4 className="text-white font-semibold">Nearby Devices</h4>
-                                            {nearbyDevices.map((device, index) => (
+                                            <div className="flex items-center justify-between">
+                                                <h4 className="text-white font-semibold">Nearby Devices</h4>
+                                                <button
+                                                    onClick={handleScanForDevices}
+                                                    className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition-colors touch-target"
+                                                >
+                                                    🔍 Scan
+                                                </button>
+                                            </div>
+                                            {nearbyDevices.length === 0 ? (
+                                                <div className="text-center py-8 text-gray-400 text-sm">
+                                                    No devices found. Click "Scan" to discover nearby peers.
+                                                </div>
+                                            ) : (
+                                                nearbyDevices.map((device, index) => (
                                                 <div key={device.id} className="flex items-center justify-between bg-gray-800 rounded-lg p-3">
                                                     <div className="flex items-center space-x-3">
                                                         <div className={`w-3 h-3 rounded-full ${device.connected ? 'bg-green-500' : 'bg-gray-500'}`}></div>
                                                         <span className="text-white text-sm">{device.name}</span>
                                                     </div>
-                                                    <span className="text-gray-400 text-xs">
-                                                        {device.connected ? 'Connected' : 'Available'}
-                                                    </span>
+                                                    {device.connected ? (
+                                                        <span className="text-green-400 text-xs font-medium">
+                                                            Connected
+                                                        </span>
+                                                    ) : (
+                                                        <button
+                                                            onClick={() => handleConnectToDevice(device.id)}
+                                                            className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition-colors touch-target"
+                                                        >
+                                                            Connect
+                                                        </button>
+                                                    )}
                                                 </div>
-                                            ))}
+                                                ))
+                                            )}
                                         </div>
                                     </>
                                 )}

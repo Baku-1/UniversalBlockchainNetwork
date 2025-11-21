@@ -532,6 +532,87 @@ impl BluetoothMeshManager {
         });
     }
 
+    /// Manually discover and connect to a peer (for testing/demo purposes)
+    /// This creates a peer entry and triggers the discovery/connection flow
+    pub async fn manually_discover_peer(
+        &self,
+        peer_id: String,
+        address: Option<String>,
+        node_id: Option<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        tracing::info!("🔵 Manually discovering peer: {}", peer_id);
+
+        // Check if peer already exists
+        {
+            let peers = self.peers.read().await;
+            if peers.contains_key(&peer_id) {
+                tracing::info!("Peer {} already exists, attempting connection", peer_id);
+                return self.connect_to_peer(&peer_id).await;
+            }
+        }
+
+        // Create a new peer entry
+        let peer_address = address.unwrap_or_else(|| {
+            // Generate a random MAC address for the peer
+            format!("00:11:22:33:44:{:02X}", peer_id.chars().map(|c| c as u8).sum::<u8>() % 255)
+        });
+        let peer_node_id = node_id.unwrap_or_else(|| format!("node_{}", peer_id));
+
+        // Skip if this is our own node
+        if peer_node_id == self.node_keys.node_id() {
+            return Err("Cannot connect to self".into());
+        }
+
+        let discovered_peer = MeshPeer {
+            id: peer_id.clone(),
+            address: peer_address.clone(),
+            node_id: peer_node_id.clone(),
+            last_seen: std::time::SystemTime::now(),
+            connection_quality: 0.8,
+            is_connected: false,
+            capabilities: PeerCapabilities {
+                supports_mesh_validation: true,
+                supports_transaction_relay: true,
+                supports_store_forward: true,
+                max_message_size: 1024,
+                protocol_version: "1.0".to_string(),
+            },
+        };
+
+        // Store the peer in the peers list
+        {
+            let mut peers = self.peers.write().await;
+            peers.insert(discovered_peer.id.clone(), discovered_peer.clone());
+        }
+
+        // Add to mesh topology
+        {
+            let mut topology = self.mesh_topology.write().await;
+            topology.add_node(crate::mesh_topology::NodeInfo {
+                node_id: discovered_peer.node_id.clone(),
+                last_seen: discovered_peer.last_seen,
+                hop_count: 1,
+                connection_quality: discovered_peer.connection_quality,
+                capabilities: vec![
+                    "mesh_validation".to_string(),
+                    "transaction_relay".to_string(),
+                    "store_forward".to_string(),
+                ],
+            });
+        }
+
+        tracing::info!("🔵 Stored peer {} in peers list and topology", discovered_peer.id);
+
+        // Send the discovery event to trigger connection
+        if let Err(e) = self.mesh_events.send(MeshEvent::PeerDiscovered(discovered_peer)).await {
+            tracing::warn!("Failed to send PeerDiscovered event: {}", e);
+            return Err(format!("Failed to trigger discovery event: {}", e).into());
+        }
+
+        tracing::info!("🔵 Peer discovery event sent for peer: {}", peer_id);
+        Ok(())
+    }
+
     /// Connect to a discovered peer
     pub async fn connect_to_peer(&self, peer_id: &str) -> Result<(), Box<dyn std::error::Error>> {
         // Implement actual BLE connection logic

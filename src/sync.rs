@@ -82,7 +82,7 @@ impl Web3SyncManager {
             // Start synchronization
             let _ = event_tx.send(SyncEvent::SyncStarted).await;
             
-            let sync_result = self.perform_sync().await;
+            let sync_result = self.perform_sync(&event_tx).await;
             match sync_result {
                 Err(e) => {
                     let error_msg = e.to_string();
@@ -98,7 +98,7 @@ impl Web3SyncManager {
     }
 
     /// Perform the actual synchronization
-    async fn perform_sync(&self) -> Result<(), String> {
+    async fn perform_sync(&self, event_tx: &mpsc::Sender<SyncEvent>) -> Result<(), String> {
         let start_time = std::time::Instant::now();
         
         // Set syncing flag
@@ -112,15 +112,31 @@ impl Web3SyncManager {
         
         // Process transactions from the queue
         while let Some(queued_tx) = self.transaction_queue.get_next_transaction().await {
-            match self.sync_transaction(queued_tx).await {
-                Ok(_) => {
-                    synced_count += 1;
-                    tracing::debug!("Successfully synced transaction");
+            let tx_id = queued_tx.id;
+            
+            // Extract result and error message in a block scope to ensure Send trait
+            let (is_success, error_msg_opt) = {
+                let sync_result = self.sync_transaction(queued_tx, event_tx).await;
+                match sync_result {
+                    Ok(_) => (true, None),
+                    Err(e) => {
+                        // Convert error to String immediately to ensure Send trait
+                        (false, Some(e.to_string()))
+                    }
                 }
-                Err(e) => {
-                    failed_count += 1;
-                    tracing::warn!("Failed to sync transaction: {}", e);
-                }
+            };
+            
+            if is_success {
+                synced_count += 1;
+                tracing::debug!("Successfully synced transaction {}", tx_id);
+                // Emit per-transaction success event
+                let _ = event_tx.send(SyncEvent::TransactionSynced(tx_id)).await;
+            } else {
+                failed_count += 1;
+                let error_msg = error_msg_opt.unwrap_or_else(|| "Unknown error".to_string());
+                tracing::warn!("Failed to sync transaction {}: {}", tx_id, error_msg);
+                // Emit per-transaction failure event
+                let _ = event_tx.send(SyncEvent::TransactionFailed(tx_id, error_msg)).await;
             }
             
             // Add small delay between transactions to avoid overwhelming the network
@@ -158,7 +174,10 @@ impl Web3SyncManager {
     async fn sync_transaction(
         &self,
         queued_tx: crate::transaction_queue::QueuedTransaction,
+        _event_tx: &mpsc::Sender<SyncEvent>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Note: Events are emitted in perform_sync after sync_transaction completes
+        // This allows us to capture both success and failure cases with proper error messages
         match queued_tx.transaction {
             TransactionType::Ronin(ronin_tx) => {
                 self.sync_ronin_transaction(queued_tx.id, ronin_tx).await
@@ -420,7 +439,11 @@ impl Web3SyncManager {
             return Err("Sync already in progress".into());
         }
 
-        self.perform_sync().await.map_err(|e| e.into())
+        // Create a temporary event channel for force_sync
+        // Note: Events from force_sync won't be consumed by the main event loop
+        // If you need events from force_sync, consider adding an event_tx parameter
+        let (_tx, _rx) = mpsc::channel(100);
+        self.perform_sync(&_tx).await.map_err(|e| e.into())
     }
 }
 

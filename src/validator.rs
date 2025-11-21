@@ -146,6 +146,11 @@ pub async fn start_validator(
 }
 
 /// Legacy function for block validation (kept for backward compatibility)
+/// 
+/// # Deprecated
+/// This function is deprecated. Use `start_validator` instead.
+#[deprecated(note = "Use start_validator instead. This function is kept for backward compatibility only.")]
+#[allow(dead_code)] // Kept for backward compatibility, not actively used
 pub async fn start_block_validator(
     mut from_p2p: mpsc::Receiver<BlockToValidate>,
     to_p2p: mpsc::Sender<ValidatedBlock>,
@@ -338,7 +343,7 @@ async fn validate_transaction(tx_data: &TransactionData) -> TransactionResult {
     }
     
     // Validate addresses are proper format (hex addresses)
-    if !tx_data.from.starts_with("0x") || !tx_data.to.starts_with("0x") {
+    if !crate::web3::utils::is_valid_address(&tx_data.from) || !crate::web3::utils::is_valid_address(&tx_data.to) {
         tracing::warn!("Transaction addresses not in proper hex format");
         is_valid = false;
     }

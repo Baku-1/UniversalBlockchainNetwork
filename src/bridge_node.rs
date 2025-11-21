@@ -332,6 +332,21 @@ impl BridgeNode {
 
     /// Create Ronin transaction from net transfer
     async fn create_ronin_transaction_from_transfer(&self, transfer: &NetTransfer) -> Result<RoninTransaction> {
+        // Use utility function for RON token transfers
+        if matches!(transfer.token_type, TokenType::RON) {
+            let gas_price = 20_000_000_000; // 20 gwei
+            let chain_id = self.ronin_client.get_chain_id();
+            return Ok(crate::web3::utils::create_ron_transfer(
+                transfer.from_address.clone(),
+                transfer.to_address.clone(),
+                transfer.net_amount as u64,
+                0, // Nonce will be set by sync manager
+                gas_price,
+                chain_id,
+            ));
+        }
+        
+        // For other token types, create transaction manually
         let tx = RoninTransaction {
             id: Uuid::new_v4(),
             from: transfer.from_address.clone(),
@@ -345,7 +360,7 @@ impl BridgeNode {
             },
             nonce: 0, // Will be set by sync manager
             data: self.encode_transfer_data(transfer).await?,
-            chain_id: 2020, // Ronin mainnet
+            chain_id: self.ronin_client.get_chain_id(),
             created_at: SystemTime::now(),
             status: TransactionStatus::Pending,
         };

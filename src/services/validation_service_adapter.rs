@@ -2,15 +2,18 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 use anyhow::Result;
 
 use crate::services::validation_business_services::ValidationBusinessService;
+use crate::validator::{ComputationTask, TaskResult};
 use super::Service;
 
 pub struct ValidationServiceAdapter {
     inner: Arc<ValidationBusinessService>,
     tick_counter: tokio::sync::RwLock<u32>,
+    validator_handle: tokio::sync::RwLock<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ValidationServiceAdapter {
@@ -18,7 +21,22 @@ impl ValidationServiceAdapter {
         Self {
             inner,
             tick_counter: tokio::sync::RwLock::new(0),
+            validator_handle: tokio::sync::RwLock::new(None),
         }
+    }
+
+    /// Initialize validator event loop with channels from mesh/P2P infrastructure
+    /// This integrates the legacy validator::start_validator into the adapter system
+    pub async fn initialize_validator_loop(
+        &self,
+        task_rx: mpsc::Receiver<ComputationTask>,
+        result_tx: mpsc::Sender<TaskResult>,
+        p2p_result_tx: Option<mpsc::Sender<TaskResult>>,
+    ) {
+        tracing::info!("✅ Validation Service Adapter: Initializing validator event loop");
+        let handle = self.inner.start_validator_event_loop(task_rx, result_tx, p2p_result_tx);
+        let mut validator_handle = self.validator_handle.write().await;
+        *validator_handle = Some(handle);
     }
 
     pub fn default_interval() -> Duration {
@@ -73,11 +91,27 @@ impl Service for ValidationServiceAdapter {
                 .await;
         }
 
+        // Every 7 ticks, monitor lending pool for validation purposes
+        if tick_num % 7 == 0 {
+            let _ = self
+                .inner
+                .monitor_lending_pool_for_validation()
+                .await;
+        }
+
         Ok(())
     }
 
     async fn shutdown(&self) -> Result<()> {
         tracing::info!("✅ Validation service adapter shutting down");
+        
+        // Abort validator event loop if it's running
+        let mut validator_handle = self.validator_handle.write().await;
+        if let Some(handle) = validator_handle.take() {
+            handle.abort();
+            tracing::info!("✅ Validation Service Adapter: Validator event loop stopped");
+        }
+        
         Ok(())
     }
 }
